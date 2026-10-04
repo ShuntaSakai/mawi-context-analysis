@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mawi-context-analysis"
+version = "0.1.0"
+description = "Portable packet context for flows observed in MAWI captures"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = ["dpkt", "pandas", "pyarrow"]
+
+[project.scripts]
+mawi-context = "mawi_context.cli:main"
+
+[dependency-groups]
+dev = ["pytest"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
