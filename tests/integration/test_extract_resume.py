@@ -377,3 +377,58 @@ def test_cohort_observation_times_match_flows_exactly(setup,monkeypatch):
     manifest=p.parent/'cohort_manifest.json';m=load_json_object(manifest)
     m['artifact']['sha256']=sha256_file(p);write_json_atomically(manifest,m)
     with pytest.raises(ValueError):ex.run_extract(o,source_url_resolver=resolver)
+
+
+def test_capacity_exhaustion_is_incomplete_and_resume_drains_raw(setup, monkeypatch):
+    from mawi_context.chunks import expected_chunk_ids
+    o, downloads = setup
+    ids = expected_chunk_ids(DAY)[:10]
+    monkeypatch.setattr(ex, 'expected_chunk_ids', lambda day: ids)
+    monkeypatch.setattr(ex, 'ProcessPoolExecutor', ThreadPoolExecutor)
+    scan = ex._scan_chunk_worker
+    scanned = []
+    def fail(task):
+        scanned.append(task.chunk_id)
+        raise ValueError('retained raw failure')
+    monkeypatch.setattr(ex, '_scan_chunk_worker', fail)
+    with pytest.raises(ex.IncompleteExtractionError):
+        ex.run_extract(o, source_url_resolver=resolver)
+    path = o.dataset_root/'dataset_manifest.json'
+    first = load_json_object(path)
+    retained = set(downloads)
+    assert len(retained) == o.workers + 2
+    assert len(scanned) == len(set(scanned)) == len(retained)
+    assert len(list(o.spool_root.glob('*.pcap.gz'))) == len(retained)
+    assert first['status'] == 'incomplete'
+    assert all(first['chunks'][c]['status'] == ('failed' if c in retained else 'pending') for c in ids)
+    assert not list((o.dataset_root/'observations').glob('20*'))
+
+    downloads.clear()
+    scanned.clear()
+    def recover(task):
+        scanned.append(task.chunk_id)
+        return scan(task)
+    monkeypatch.setattr(ex, '_scan_chunk_worker', recover)
+    assert ex.run_extract(o, source_url_resolver=resolver) == o.dataset_root
+    assert set(downloads) == set(ids) - retained
+    assert set(scanned) == set(ids)
+    assert load_json_object(path)['status'] == 'success'
+    assert list(o.spool_root.iterdir()) == []
+
+
+def test_target_bootstrap_respects_preexisting_full_spool(setup, monkeypatch):
+    from mawi_context.chunks import expected_chunk_ids
+    o, downloads = setup
+    ids = expected_chunk_ids(DAY)[:10]
+    monkeypatch.setattr(ex, 'expected_chunk_ids', lambda day: ids)
+    for chunk in ids[1:o.workers+3]:
+        dl.download_chunk(chunk, resolver(DAY, chunk), o.spool_root)
+    before = {p: p.read_bytes() for p in o.spool_root.iterdir()}
+    downloads.clear()
+    with pytest.raises(ex.IncompleteExtractionError):
+        ex.run_extract(o, source_url_resolver=resolver)
+    assert downloads == []
+    assert {p: p.read_bytes() for p in o.spool_root.iterdir()} == before
+    m = load_json_object(o.dataset_root/'dataset_manifest.json')
+    assert m['status'] == 'incomplete'
+    assert all(m['chunks'][c]['status'] == 'pending' for c in ids[1:])

@@ -151,15 +151,29 @@ def _failure(states: dict, chunk: str, phase: str, error: Exception) -> None:
 
 
 def _schedule_chunks(options, chunk_ids, identity, states, progress, resolver, downloads, scans):
-    """Bounded futures: <=2 downloads, <=workers scans, <=workers+2 active raw.
+    """Bound downloads, scans and retained raw with workers+2 raw slots.
 
-    Failed raw captures are deliberately retained and are outside the active
-    spool bound. No failed scan is submitted again in this run.
+    Each planned chunk with raw on disk or in flight consumes one slot,
+    including failed and preexisting raw. Existing raw above the limit may
+    still be scanned; new downloads wait for capacity. Failed raw is never
+    deleted to free capacity, and no failed scan is retried in this run.
     Executors are injected so scheduling can be exercised without processes.
     """
     pending = deque(chunk_ids)
     ready = deque()
     downloading, scanning = {}, {}
+    capacity = options.workers + 2
+    raw_paths = {chunk: _paths(chunk, options.spool_root)[0] for chunk in chunk_ids}
+
+    def raw_slots_used():
+        # A completed download can already be on disk while its future is
+        # still tracked. Union IDs avoids counting that capture twice.
+        present = {chunk for chunk, path in raw_paths.items() if os.path.lexists(path)}
+        reserved = (set(downloading.values())
+                    | {source.chunk_id for source in ready}
+                    | {task.chunk_id for task in scanning.values()})
+        return len(present | reserved)
+
     parent = options.dataset_root/'observations'
     if parent.is_symlink():
         raise ValueError('observations directory must not be a symlink')
@@ -178,8 +192,9 @@ def _schedule_chunks(options, chunk_ids, identity, states, progress, resolver, d
                     shutil.rmtree(stage, ignore_errors=True)
                 _failure(states, source.chunk_id, 'scan', error)
                 progress()
-        while (pending and len(downloading) < 2
-               and len(downloading)+len(scanning)+len(ready) < options.workers+2):
+        # Examine every pending chunk once per pass: a blocked missing raw
+        # must not hide a later final cache or already-owned raw capture.
+        for _ in range(len(pending)):
             chunk = pending.popleft()
             try:
                 url = resolver(options.day, chunk)
@@ -197,14 +212,19 @@ def _schedule_chunks(options, chunk_ids, identity, states, progress, resolver, d
                     states[chunk] = dict(status='success', source=asdict(source), manifest=f'observations/{chunk}/manifest.json')
                     progress()
                     continue
+                if len(downloading)+len(scanning)+len(ready) >= capacity:
+                    pending.append(chunk)
+                    continue
                 owned = _owned_source(chunk, url, options.spool_root)
                 if owned is not None:
                     if 'source' in states[chunk] and states[chunk]['source'] != asdict(owned):
                         raise ValueError('prior raw source identity mismatch')
                     states[chunk]['source'] = asdict(owned)
                     ready.append(owned)
-                else:
+                elif len(downloading) < 2 and raw_slots_used() < capacity:
                     downloading[downloads.submit(download_chunk, chunk, url, options.spool_root)] = chunk
+                else:
+                    pending.append(chunk)
             except Exception as error:
                 _failure(states, chunk, 'acquisition-or-cache', error)
                 progress()
@@ -213,7 +233,12 @@ def _schedule_chunks(options, chunk_ids, identity, states, progress, resolver, d
             continue
         futures = set(downloading) | set(scanning)
         if not futures:
-            continue
+            # Later cache reuse may have released capacity after an earlier
+            # missing raw was deferred. Otherwise exhaustion ends the run,
+            # leaving unattempted chunks pending for the next invocation.
+            if pending and raw_slots_used() < capacity:
+                continue
+            break
         done, _ = wait(futures, return_when=FIRST_COMPLETED)
         for future in done:
             if future in downloading:
@@ -450,6 +475,13 @@ def run_extract(
     provenance_existed = any(os.path.lexists(options.dataset_root/name) for name in ('provenance','cohort'))
     prior_target = previous['chunks'][options.target_chunk].get('source') if previous is not None else None
     try:
+        # Bootstrap also consumes raw capacity. Without target provenance we
+        # cannot scan existing raw to release slots, so fail safely when full.
+        if (not provenance_existed
+                and not os.path.lexists(_paths(options.target_chunk, options.spool_root)[0])
+                and sum(os.path.lexists(_paths(c, options.spool_root)[0]) for c in ids)
+                >= options.workers + 2):
+            raise ValueError('raw spool capacity exhausted before target acquisition')
         source, identity = _target_provenance(options, source_url_resolver, prior_target)
     except Exception as error:
         if provenance_existed:
