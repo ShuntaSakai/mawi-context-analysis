@@ -365,3 +365,45 @@ def test_download_reservations_count_before_raw_bytes_exist(disk_spool_scheduler
                         lambda day,c: 'https://example/'+c, downloads, Scans())
     assert len(list(o.spool_root.glob('*.pcap.gz'))) == o.workers + 2
     assert sum(s['status'] == 'pending' for s in state.values()) == 6
+
+
+def test_preexisting_mixed_failures_do_not_starve_later_owned_raw(disk_spool_scheduler):
+    o, ids, failures, downloaded, scanned, released, occupancy, make_raw, run = disk_spool_scheduler
+    existing = ids[:6]
+    for chunk in existing:
+        make_raw(chunk)
+    failures.clear()
+    failures.update(existing[:4])
+    state = run()
+    assert set(scanned) == set(existing)
+    assert len(scanned) == len(set(scanned)) == 6
+    assert all(state[c]['status'] == 'failed' for c in existing[:4])
+    assert all(state[c]['status'] == 'success' for c in existing[4:])
+    assert set(released) == set(existing[4:])
+    assert {p.name for p in o.spool_root.glob('*.pcap.gz')} == {c+'.pcap.gz' for c in existing[:4]}
+    assert downloaded == []
+    assert all(state[c]['status'] == 'pending' for c in ids[6:])
+
+
+def test_owned_raw_ready_queue_uses_scan_prefetch_bound(disk_spool_scheduler, monkeypatch):
+    from collections import deque
+    o, ids, failures, downloaded, scanned, released, occupancy, make_raw, run = disk_spool_scheduler
+    for chunk in ids:
+        make_raw(chunk)
+    failures.clear()
+    failures.update(ids[:4])
+    ready_lengths = []
+    class ObservedDeque(deque):
+        def __init__(self, *args):
+            super().__init__(*args)
+            self.is_ready = not args
+        def append(self, value):
+            super().append(value)
+            if self.is_ready:
+                ready_lengths.append(len(self))
+    monkeypatch.setattr(ex, 'deque', ObservedDeque)
+    state = run()
+    assert max(ready_lengths) <= o.workers
+    assert len(scanned) == len(set(scanned)) == len(ids)
+    assert downloaded == []
+    assert all(state[c]['status'] == 'success' for c in ids[4:])

@@ -212,16 +212,23 @@ def _schedule_chunks(options, chunk_ids, identity, states, progress, resolver, d
                     states[chunk] = dict(status='success', source=asdict(source), manifest=f'observations/{chunk}/manifest.json')
                     progress()
                     continue
-                if len(downloading)+len(scanning)+len(ready) >= capacity:
+                # Existing raw does not increase spool usage. Only the scan
+                # queue limits its admission; defer hashing until a slot opens.
+                scan_queue_full = len(scanning)+len(ready) >= options.workers
+                if os.path.lexists(raw_paths[chunk]) and scan_queue_full:
                     pending.append(chunk)
                     continue
                 owned = _owned_source(chunk, url, options.spool_root)
                 if owned is not None:
+                    if scan_queue_full:
+                        pending.append(chunk)
+                        continue
                     if 'source' in states[chunk] and states[chunk]['source'] != asdict(owned):
                         raise ValueError('prior raw source identity mismatch')
                     states[chunk]['source'] = asdict(owned)
                     ready.append(owned)
-                elif len(downloading) < 2 and raw_slots_used() < capacity:
+                elif (len(downloading) < 2 and raw_slots_used() < capacity
+                      and len(downloading)+len(scanning)+len(ready) < capacity):
                     downloading[downloads.submit(download_chunk, chunk, url, options.spool_root)] = chunk
                 else:
                     pending.append(chunk)

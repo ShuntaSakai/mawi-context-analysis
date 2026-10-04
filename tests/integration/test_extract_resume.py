@@ -432,3 +432,41 @@ def test_target_bootstrap_respects_preexisting_full_spool(setup, monkeypatch):
     m = load_json_object(o.dataset_root/'dataset_manifest.json')
     assert m['status'] == 'incomplete'
     assert all(m['chunks'][c]['status'] == 'pending' for c in ids[1:])
+
+
+def test_preexisting_over_capacity_mixed_failure_and_success(setup, monkeypatch):
+    from mawi_context.chunks import expected_chunk_ids
+    o, downloads = setup
+    ids = expected_chunk_ids(DAY)[:7]
+    monkeypatch.setattr(ex, 'expected_chunk_ids', lambda day: ids)
+    monkeypatch.setattr(ex, 'ProcessPoolExecutor', ThreadPoolExecutor)
+    # Create reusable target provenance and six captures, as an older run or
+    # recovery could leave them. The seventh capture remains missing.
+    ex._target_provenance(o, resolver)
+    for chunk in ids[1:6]:
+        dl.download_chunk(chunk, resolver(DAY, chunk), o.spool_root)
+    downloads.clear()
+    scan = ex._scan_chunk_worker
+    scanned = []
+    def mixed(task):
+        scanned.append(task.chunk_id)
+        if task.chunk_id in ids[:4]:
+            raise ValueError('retained preexisting raw')
+        return scan(task)
+    monkeypatch.setattr(ex, '_scan_chunk_worker', mixed)
+    with pytest.raises(ex.IncompleteExtractionError):
+        ex.run_extract(o, source_url_resolver=resolver)
+    manifest = load_json_object(o.dataset_root/'dataset_manifest.json')
+    assert len(scanned) == len(set(scanned)) == 6
+    assert set(scanned) == set(ids[:6])
+    assert downloads == []
+    assert manifest['status'] == 'incomplete'
+    assert all(manifest['chunks'][c]['status'] == 'failed' for c in ids[:4])
+    assert all(manifest['chunks'][c]['status'] == 'success' for c in ids[4:6])
+    assert manifest['chunks'][ids[6]]['status'] == 'pending'
+    assert {p.name for p in o.spool_root.iterdir()} == {
+        c+suffix for c in ids[:4] for suffix in ('.pcap.gz', '.download.json')
+    }
+    for chunk in ids[4:6]:
+        ex.load_validated_chunk(o.dataset_root, chunk,
+                               expected_cohort_identity=manifest['cohort_identity'])
