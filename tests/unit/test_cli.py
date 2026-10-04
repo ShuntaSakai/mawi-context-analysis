@@ -159,3 +159,26 @@ def test_main_dispatches_selected_command(module_name, handler_name, argv, comma
     assert main(argv) == 7
     assert len(received) == 1
     assert received[0].command == command
+
+
+def test_extract_help_describes_calendar_format(capsys):
+    with pytest.raises(SystemExit): main(['extract','--help'])
+    assert 'YYYY-MM-DD' in capsys.readouterr().out
+
+
+def test_task6_handler_default_roots_and_exit_status(tmp_path,monkeypatch):
+    import mawi_context.extraction as ex
+    from mawi_context.manifests import write_json_atomically
+    monkeypatch.chdir(tmp_path)
+    seen=[]
+    status='success'
+    def run(options):
+        seen.append(options)
+        path=options.dataset_root/'dataset_manifest.json';write_json_atomically(path,{'status':status});return options.dataset_root
+    monkeypatch.setattr(ex,'run_extract',run)
+    assert main(EXTRACT_ARGS)==0
+    assert seen[0].dataset_root==tmp_path/'data/202604081400/portable_dataset'
+    assert seen[0].spool_root==tmp_path/'data/202604081400/spool'
+    status='incomplete';assert main(EXTRACT_ARGS)==1
+    args=EXTRACT_ARGS.copy();args[args.index('--day')+1]='2026-4-8'
+    assert main(args)==1 and len(seen)==2

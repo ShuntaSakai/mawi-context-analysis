@@ -29,7 +29,7 @@ def build_parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="command", required=True)
 
     extract = commands.add_parser("extract", help="Extract a portable observation dataset")
-    extract.add_argument("--day", required=True)
+    extract.add_argument("--day", required=True, help="Calendar day in YYYY-MM-DD format")
     extract.add_argument("--target-chunk", required=True)
     extract.add_argument(
         "--packet-counts", required=True, nargs="+", type=_positive_int,
