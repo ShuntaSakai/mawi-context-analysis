@@ -25,6 +25,7 @@ from mawi_context.cohort import COHORT_COLUMNS, build_context_indexes, select_ta
 from mawi_context.flow import Endpoint, FLOW_COLUMNS, FlowKey
 from mawi_context.manifests import (
     artifact_record, cohort_identity, load_json_object, resolve_artifact_path,
+    validate_skipped_packet_counts,
 )
 from mawi_context.observations import (
     CHUNK_MANIFEST_SCHEMA_VERSION, SOURCE_CONTEXT_SCHEMA_VERSION,
@@ -66,7 +67,7 @@ CONTEXT_RESULT_COLUMNS = (
     *(f'{metric}_{horizon}' for horizon in _HORIZONS for metric in _UDP_METRICS),
 )
 
-# Task 6's durable v1 identities, checked locally without importing acquisition.
+# Durable extraction v2 identities, checked locally without importing acquisition.
 _FLOW_DEFINITION = {
     'protocols': [6, 17], 'key': 'direction-independent-bidirectional-5-tuple',
     'inactivity_timeout': None, 'src_dst': 'first-observed-packet-direction',
@@ -74,7 +75,7 @@ _FLOW_DEFINITION = {
 _CONTEXT_SOURCE_POLICY = {
     'tcp': 'initial-plain-syn-sender-else-first-observed-src', 'udp': 'first-observed-src',
 }
-_TOOL_IDENTITY = {'name': 'mawi-context-analysis', 'version': '0.1.0', 'extraction': 'v1'}
+_TOOL_IDENTITY = {'name': 'mawi-context-analysis', 'version': '0.1.0', 'extraction': 'v2'}
 _OBSERVATION_VERSIONS = {
     'target_packets': TARGET_PACKET_SCHEMA_VERSION,
     'source_context_packets': SOURCE_CONTEXT_SCHEMA_VERSION,
@@ -195,12 +196,13 @@ def _validate_dataset(root):
     fm = load_json_object(root/dm['flow_manifest'])
     cm = load_json_object(root/dm['cohort_manifest'])
     _require_keys(fm, ('manifest_schema_version','status','target_chunk','source',
-                       'flow_definition','tool','artifact'), 'flow manifest')
+                       'flow_definition','tool','artifact','skipped_packet_counts'), 'flow manifest')
     _require_keys(cm, ('manifest_schema_version','status','target_chunk','source','packet_counts',
                        'context_source_policy','cohort_identity','tool','artifact'), 'cohort manifest')
+    validate_skipped_packet_counts(fm['skipped_packet_counts'])
     source = _source(fm['source'])
     if (source.chunk_id != dm['target_chunk'] or cm['source'] != asdict(source)
-            or fm['manifest_schema_version'] != 'flow-manifest-v1'
+            or fm['manifest_schema_version'] != 'flow-manifest-v2'
             or cm['manifest_schema_version'] != 'cohort-manifest-v1'
             or fm['flow_definition'] != _FLOW_DEFINITION
             or cm['context_source_policy'] != _CONTEXT_SOURCE_POLICY
@@ -234,8 +236,11 @@ def _validate_dataset(root):
         manifest = load_validated_chunk(root,chunk,expected_cohort_identity=identity)
         if manifest['source'] != state['source']:
             raise ValueError('chunk source disagrees with dataset state')
-        if chunk == dm['target_chunk'] and manifest['source'] != asdict(source):
-            raise ValueError('target chunk source disagrees with provenance')
+        if chunk == dm['target_chunk']:
+            if manifest['source'] != asdict(source):
+                raise ValueError('target chunk source disagrees with provenance')
+            if manifest['skipped_packet_counts'] != fm['skipped_packet_counts']:
+                raise ValueError('target chunk skip counts disagree with flow provenance')
     return dm, cohort
 
 

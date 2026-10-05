@@ -14,7 +14,7 @@ import tempfile
 import pandas as pd
 
 from mawi_context.cohort import build_context_indexes
-from mawi_context.flow import FlowKey
+from mawi_context.flow import FlowKey, SKIP_PACKET_REASONS
 from mawi_context.hashing import sha256_file, stable_json_hash
 
 
@@ -68,6 +68,19 @@ def load_json_object(path: Path) -> dict[str, object]:
     if not isinstance(value, dict):
         raise ValueError('manifest root must be a JSON object')
     return value
+
+
+def validate_skipped_packet_counts(value: object) -> dict[str, int]:
+    """Require known stable reason codes and nonnegative integer counts.
+
+    Booleans, numeric coercions and arbitrary diagnostic strings are forbidden.
+    Return sorted facts for canonical durable serialization; zero is allowed.
+    """
+    if (not isinstance(value, dict)
+            or any(not isinstance(reason, str) or reason not in SKIP_PACKET_REASONS
+                   or type(count) is not int or count < 0 for reason, count in value.items())):
+        raise ValueError('invalid skipped_packet_counts: expected known reasons and nonnegative integers')
+    return dict(sorted(value.items()))
 
 
 def _integer_fact(value: object, column: str, minimum: int) -> int:

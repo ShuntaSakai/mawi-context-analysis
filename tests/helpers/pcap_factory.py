@@ -54,3 +54,21 @@ def write_capture(path, records=(), *, ng=False, compressed=False, **kwargs):
     data = (pcapng_bytes if ng else pcap_bytes)(records, **kwargs)
     path.write_bytes(gzip.compress(data, mtime=0) if compressed else data)
     return path
+
+
+def malformed_tcp_smoke_packet():
+    """Synthetic structure of the reported MAWI packet; no real raw bytes.
+
+    Ethernet 14 + IPv4 20 + TCP minimum 20 captured; original IP total 72.
+    DF only, zero ports, Data Offset 0 and flags 0. Original frame is 86.
+    """
+    frame = bytearray(packet(sport=0, dport=0, flags=0, fragment=0x4000,
+                             payload=b'x'*32))
+    frame[46] = 0
+    return bytes(frame[:54])
+
+
+def malformed_udp_packet():
+    frame = bytearray(packet(protocol=17))
+    frame[38:40] = struct.pack('!H', 7)
+    return bytes(frame)

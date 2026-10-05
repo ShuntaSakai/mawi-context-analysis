@@ -63,12 +63,32 @@ class FlowParseResult:
     skipped_packet_counts: dict[str, int]
 
 
+PACKET_DECODE_REASONS = frozenset({
+    'packet_header_exceeds_declared_length', 'incomplete_packet_header',
+    'ethernet_ip_version_mismatch', 'malformed_ipv4_length',
+    'ipv4_length_exceeds_original_frame_length', 'ipv6_length_exceeds_original_frame_length',
+    'malformed_ipv6_authentication_header_length', 'malformed_tcp_header_length',
+    'malformed_udp_length',
+})
+SKIP_PACKET_REASONS = PACKET_DECODE_REASONS | frozenset({
+    'non_ip', 'non_tcp_udp', 'capture_truncated_undecodable', 'ip_fragment',
+})
+
+
 class PacketDecodeError(ValueError):
-    """Malformed packet facts in an otherwise complete capture record."""
+    """Malformed packet facts with a stable reason and a diagnostic message."""
+
+    def __init__(self, reason: str, message: str):
+        if reason not in PACKET_DECODE_REASONS:
+            raise ValueError('unknown packet decode reason')
+        self.reason = reason
+        super().__init__(message)
 
 
 class _SkipPacket(Exception):
-    pass
+    def __init__(self, reason: str):
+        self.reason = reason
+        super().__init__(reason)
 
 
 @dataclass(frozen=True)
@@ -96,11 +116,11 @@ def _decode(record: CaptureRecord) -> _PacketFacts:
 
     def need(end: int, limit: int | None = None) -> None:
         if end > record.original_length or (limit is not None and end > limit):
-            raise PacketDecodeError('packet header exceeds declared length')
+            raise PacketDecodeError('packet_header_exceeds_declared_length', 'packet header exceeds declared length')
         if end > len(frame):
             if record.captured_length < record.original_length:
                 raise _SkipPacket('capture_truncated_undecodable')
-            raise PacketDecodeError('incomplete packet header')
+            raise PacketDecodeError('incomplete_packet_header', 'incomplete packet header')
 
     need(14)
     ethertype = struct.unpack_from('!H', frame, 12)[0]
@@ -115,16 +135,16 @@ def _decode(record: CaptureRecord) -> _PacketFacts:
     version = 4 if ethertype == 0x0800 else 6
     need(pos+1)
     if frame[pos] >> 4 != version:
-        raise PacketDecodeError('Ethernet/IP version mismatch')
+        raise PacketDecodeError('ethernet_ip_version_mismatch', 'Ethernet/IP version mismatch')
     if version == 4:
         need(pos+20)
         header_length = (frame[pos] & 15)*4
         total = struct.unpack_from('!H', frame, pos+2)[0]
         if header_length < 20 or total < header_length:
-            raise PacketDecodeError('malformed IPv4 length')
+            raise PacketDecodeError('malformed_ipv4_length', 'malformed IPv4 length')
         end = ip_start+total
         if end > record.original_length:
-            raise PacketDecodeError('IPv4 length exceeds original frame length')
+            raise PacketDecodeError('ipv4_length_exceeds_original_frame_length', 'IPv4 length exceeds original frame length')
         need(pos+header_length, end)
         protocol = frame[pos+9]
         src = str(ipaddress.ip_address(frame[pos+12:pos+16]))
@@ -138,7 +158,7 @@ def _decode(record: CaptureRecord) -> _PacketFacts:
         total = 40+payload_length
         end = ip_start+total
         if end > record.original_length:
-            raise PacketDecodeError('IPv6 length exceeds original frame length')
+            raise PacketDecodeError('ipv6_length_exceeds_original_frame_length', 'IPv6 length exceeds original frame length')
         protocol = frame[pos+6]
         src = str(ipaddress.ip_address(frame[pos+8:pos+24]))
         dst = str(ipaddress.ip_address(frame[pos+24:pos+40]))
@@ -157,7 +177,7 @@ def _decode(record: CaptureRecord) -> _PacketFacts:
             elif protocol == 51:
                 length = (frame[pos+1]+2)*4
                 if length < 12 or length % 8:
-                    raise PacketDecodeError('malformed IPv6 authentication header length')
+                    raise PacketDecodeError('malformed_ipv6_authentication_header_length', 'malformed IPv6 authentication header length')
             else:
                 length = (frame[pos+1]+1)*8
             need(pos+length, end)
@@ -172,14 +192,14 @@ def _decode(record: CaptureRecord) -> _PacketFacts:
     if protocol == 6:
         header_length = (frame[pos+12] >> 4)*4
         if header_length < 20:
-            raise PacketDecodeError('malformed TCP header length')
+            raise PacketDecodeError('malformed_tcp_header_length', 'malformed TCP header length')
         need(pos+header_length, end)
         payload = end-pos-header_length
         flags = frame[pos+13]
     else:
         length = struct.unpack_from('!H', frame, pos+4)[0]
         if length < 8 or pos+length > end:
-            raise PacketDecodeError('malformed UDP length')
+            raise PacketDecodeError('malformed_udp_length', 'malformed UDP length')
         payload = length-8
     # A missing body without a snaplen-limited record is malformed, even if
     # all transport headers were captured. Snaplen does not invent bytes.
@@ -192,7 +212,9 @@ def parse_target_flows(path: Path) -> FlowParseResult:
     """Aggregate one observation window; src/dst retain capture-first direction.
 
     start_time/end_time are first/last observed timestamps in capture order,
-    not full-communication boundaries. IDs are 1-based first-observation order.
+    not full-communication boundaries. Only validly decoded TCP/UDP packets
+    contribute; per-packet skips are counted, while CaptureError propagates.
+    IDs are 1-based first-observation order.
     captured_frame_bytes/original_frame_bytes sum the separate record facts;
     ip_bytes sums declared IP total lengths (IPv6 includes its base header);
     transport_payload_bytes sums declared TCP/UDP payload lengths.
@@ -202,8 +224,8 @@ def parse_target_flows(path: Path) -> FlowParseResult:
     for record in iter_capture_records(path):
         try:
             facts = _decode(record)
-        except _SkipPacket as error:
-            skipped[str(error)] += 1
+        except (_SkipPacket, PacketDecodeError) as error:
+            skipped[error.reason] += 1
             continue
         key = FlowKey.from_packet(facts.src_ip, facts.src_port, facts.dst_ip,
                                   facts.dst_port, facts.protocol)

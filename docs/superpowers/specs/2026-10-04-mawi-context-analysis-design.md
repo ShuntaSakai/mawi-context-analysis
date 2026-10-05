@@ -39,7 +39,7 @@ A flow key is a direction-independent bidirectional 5-tuple:
 - endpoint B port
 - transport protocol
 
-The target 15-minute capture is aggregated with no inactivity timeout. Therefore, every TCP/UDP packet in the target capture that belongs to the same normalized bidirectional 5-tuple contributes to the same observed flow, even when packets are separated by a long gap inside the 15-minute window.
+The target 15-minute capture is aggregated with no inactivity timeout. Therefore, every validly decoded TCP/UDP packet in the target capture that belongs to the same normalized bidirectional 5-tuple contributes to the same observed flow, even when packets are separated by a long gap inside the 15-minute window.
 
 The stored `src_*` / `dst_*` fields retain the direction of the first observed packet for that flow. They are observational fields and must not be interpreted automatically as client/server, initiator/responder, attacker/victim, or internal/external roles.
 
@@ -49,7 +49,7 @@ A target flow belongs to the cohort when its packet count in the target 15-minut
 
 The research meaning is therefore:
 
-> a flow observed with N packets in the designated 15-minute window
+> a flow observed with N validly decoded TCP/UDP packets in the designated 15-minute window
 
 not:
 
@@ -67,6 +67,16 @@ For each target flow:
 For a 1-packet observed flow, these values are equal.
 
 The interval is an observation-window interval, not a claim about the real beginning or end of the communication.
+
+### 2.5 Packet decode policy (focused amendment, 2026-10-05)
+
+Capture container corruption remains fatal. PCAP/PCAPNG/gzip corruption, record-boundary failures and truncated containers raise `CaptureError`; they invalidate the affected extraction and must never become packet skips. Independent chunk failure handling and parent-side raw-deletion prerequisites remain unchanged.
+
+When a `CaptureRecord` is read successfully but its Ethernet/IP/TCP/UDP declarations do not safely provide the required TCP/UDP flow facts, `PacketDecodeError` is a per-packet network/transport decode failure: exclude that packet from flows, cohort counts and both observation streams, count its stable reason, and continue. Never guess a 5-tuple, force port-zero flow membership, repair an invalid Data Offset, zero-fill truncated bytes, or suppress arbitrary exceptions.
+
+Target flow extraction and 24-hour observation extraction must apply this same skip-and-count policy. Existing `non_ip`, `non_tcp_udp`, `capture_truncated_undecodable` and `ip_fragment` exclusions remain counted. A skip is never silent. The 1/2/3 cohort means validly decoded TCP/UDP packet counts in the configured 15-minute window, not counts of all declared TCP/UDP packets or a complete communication lifetime. Retention of valid packets, direction, SYN/source selection, lengths and payload policy are unchanged.
+
+The reported laboratory smoke on target `202604081400` stopped at packet index `5968733`, timestamp `1775624416.966622`, after `4763795` decoded packets and `1204937` counted skips (`29430` capture-truncated, `10328` fragments, `7923` non-IP, `1157256` non-TCP/UDP); accounting totals `5968732` preceding records. Its synthetic regression models Ethernet/IPv4 IHL 20, total length 72, protocol 6, DF-only `0x4000`, captured/original lengths 54/86, zero ports, TCP Data Offset 0 and flags 0. The minimum 20 TCP bytes are captured, so the reason is `malformed_tcp_header_length`, not `capture_truncated_undecodable`. No real MAWI bytes enter the repository, and this amendment's validation is synthetic only.
 
 ## 3. Context source identity
 
@@ -123,7 +133,7 @@ Raw observation artifacts preserve packet facts needed for later analysis. They 
 
 ### 5.1 Target tuple observations
 
-For every 15-minute chunk, save every TCP/UDP packet whose normalized bidirectional 5-tuple matches a target cohort flow.
+For every 15-minute chunk, save every validly decoded TCP/UDP packet whose normalized bidirectional 5-tuple matches a target cohort flow.
 
 Recommended columns:
 
@@ -286,6 +296,12 @@ At minimum, manifests record enough information to establish:
 The top-level `dataset_manifest.json` records the expected 96 chunks, their completion state, and dataset-wide identity.
 
 Local absolute paths are not part of durable dataset identity.
+
+`provenance/flow_manifest.json` stores the whole target capture's `skipped_packet_counts`; every `observations/<chunk>/manifest.json` stores the whole chunk scan's map, including exclusions unrelated to cohort tuples or candidate sources. Keys are stable allowlisted snake_case codes, values are nonnegative integers (booleans, floats and coercions are rejected), and serialization is sorted/canonical. Empty maps and omitted zero-count reasons are allowed. Human-readable error messages remain diagnostics, never durable reason identity.
+
+Allowed decode-failure codes are `packet_header_exceeds_declared_length`, `incomplete_packet_header`, `ethernet_ip_version_mismatch`, `malformed_ipv4_length`, `ipv4_length_exceeds_original_frame_length`, `ipv6_length_exceeds_original_frame_length`, `malformed_ipv6_authentication_header_length`, `malformed_tcp_header_length` and `malformed_udp_length`, in addition to the four existing exclusions in §2.5. Validators reject missing/invalid maps, unknown codes and old semantic identities on reuse and portable aggregation. Aggregation also requires the target chunk's skip map to agree with target flow provenance for the same raw source. These are descriptive extraction provenance, not result classifications or additional context CSV metrics. Structural validation cannot reconstruct scan counts without raw captures or authenticate coordinated edits to otherwise valid manifests.
+
+This amendment uses `flow-manifest-v2`, `chunk-manifest-v2` and tool extraction identity `v2` (package version remains `0.1.0`). The dataset's `observation_schemas.chunk_manifest` becomes `chunk-manifest-v2`. Old extraction-v1 evidence must fail explicitly rather than be relabeled or silently reused. `dataset-manifest-v1`, `cohort-manifest-v1`, `flows-v1`, `cohort-v1`, `target-packets-v1`, `source-context-packets-v1` and all result CSV columns remain unchanged because their structures/columns are unchanged.
 
 ## 10. Download, spool, and parallel execution
 

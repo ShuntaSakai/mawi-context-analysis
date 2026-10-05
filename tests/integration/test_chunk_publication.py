@@ -10,7 +10,7 @@ import pyarrow.parquet as pq
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'helpers'))
-from pcap_factory import packet, pcap_bytes, write_capture
+from pcap_factory import packet, pcap_bytes, write_capture, malformed_tcp_smoke_packet, malformed_udp_packet
 from mawi_context import observations as obs
 from mawi_context.observations import RawSourceIdentity, extract_chunk_observations, load_validated_chunk
 from mawi_context.cohort import ContextIndexes
@@ -85,8 +85,10 @@ def test_success_exact_portable_manifest_checksums_counts_versions_and_reload(ca
     assert len(writes) == len(publishes) == len(reloads) == 1
     assert not writes[0].exists()
     assert set(p.name for p in final(case).iterdir()) == {'manifest.json', 'target_packets.parquet', 'source_context_packets.parquet'}
-    assert set(manifest) == {'manifest_schema_version', 'status', 'chunk_id', 'cohort_identity', 'source', 'artifacts'}
-    assert manifest['manifest_schema_version'] == obs.CHUNK_MANIFEST_SCHEMA_VERSION == 'chunk-manifest-v1'
+    assert set(manifest) == {'manifest_schema_version', 'status', 'chunk_id', 'cohort_identity',
+                             'source', 'artifacts', 'skipped_packet_counts'}
+    assert manifest['skipped_packet_counts'] == {}
+    assert manifest['manifest_schema_version'] == obs.CHUNK_MANIFEST_SCHEMA_VERSION == 'chunk-manifest-v2'
     assert manifest['status'] == 'success'
     assert manifest['chunk_id'] == CHUNK
     assert manifest['cohort_identity'] == COHORT
@@ -155,7 +157,7 @@ def test_invalid_identity_rejected_before_scan(case, monkeypatch, kind):
     assert capture.is_file()
 
 
-@pytest.mark.parametrize('failure', ['packet', 'capture', 'parquet', 'manifest', 'staged-validation', 'publish', 'final-reload'])
+@pytest.mark.parametrize('failure', ['capture', 'parquet', 'manifest', 'staged-validation', 'publish', 'final-reload'])
 def test_failure_leaves_no_final_cleans_only_own_staging_and_keeps_raw(case, monkeypatch, failure):
     capture, indexes, root, source = case
     parent = root/'observations'
@@ -163,9 +165,8 @@ def test_failure_leaves_no_final_cleans_only_own_staging_and_keeps_raw(case, mon
     unrelated = parent/'.staging-other-owner'
     unrelated.mkdir()
     (unrelated/'keep').write_text('keep')
-    if failure in ('packet', 'capture'):
-        capture.write_bytes(pcap_bytes([(1, packet(), 54)]) + b'broken' if failure == 'capture'
-                            else pcap_bytes([(1, packet(), 54), (2, b'\x00'*12, 12)]))
+    if failure == 'capture':
+        capture.write_bytes(pcap_bytes([(1, packet(), 54)]) + b'broken')
         source = RawSourceIdentity(CHUNK, source.source_url, sha256_file(capture), capture.stat().st_size)
         case = capture, indexes, root, source
     def fail(*args, **kwargs):
@@ -310,3 +311,48 @@ def test_interruption_after_atomic_rename_rolls_back_only_owned_final(case, monk
     assert not final(case).exists()
     assert not list((case[2]/'observations').glob('.staging-*'))
     assert case[0].is_file()
+
+
+INVALID_SKIPS = [None, [], {'arbitrary_reason': 1}, {'malformed_tcp_header_length': -1},
+                 {'non_ip': True}, {'non_ip': 1.0}, {'non_ip': '1'}, {'non_ip': None}]
+
+
+def test_chunk_persists_exact_skips_and_retains_valid_observations(case):
+    capture, lookup, root, source = case
+    write_capture(capture, [(0, packet(), 54), (1, malformed_tcp_smoke_packet(), 86),
+        (2, malformed_udp_packet(), 42), (3, packet(protocol=1), 42)])
+    source = RawSourceIdentity(CHUNK, source.source_url, sha256_file(capture), capture.stat().st_size)
+    manifest = extract((capture, lookup, root, source))
+    expected = {'malformed_tcp_header_length': 1, 'malformed_udp_length': 1, 'non_tcp_udp': 1}
+    assert manifest['skipped_packet_counts'] == expected
+    assert list(manifest['skipped_packet_counts']) == sorted(expected)
+    assert manifest['artifacts']['target_packets']['row_count'] == 1
+    assert manifest['artifacts']['source_context_packets']['row_count'] == 1
+    assert load_validated_chunk(root, CHUNK, expected_cohort_identity=COHORT) == manifest
+
+
+@pytest.mark.parametrize('skips', INVALID_SKIPS)
+def test_invalid_chunk_skip_map_is_rejected(case, skips):
+    extract(case)
+    manifest = read_manifest(case); manifest['skipped_packet_counts'] = skips
+    write_manifest(case, manifest)
+    with pytest.raises(ValueError, match='skipped_packet_counts'):
+        load_validated_chunk(case[2], CHUNK, expected_cohort_identity=COHORT)
+
+
+def test_old_chunk_manifest_rejected(case):
+    extract(case)
+    manifest = read_manifest(case)
+    manifest['manifest_schema_version'] = 'chunk-manifest-v1'
+    manifest.pop('skipped_packet_counts', None)
+    write_manifest(case, manifest)
+    with pytest.raises(ValueError):
+        load_validated_chunk(case[2], CHUNK, expected_cohort_identity=COHORT)
+
+
+def test_chunk_missing_skip_provenance_is_rejected(case):
+    extract(case)
+    manifest = read_manifest(case); manifest.pop('skipped_packet_counts')
+    write_manifest(case, manifest)
+    with pytest.raises(ValueError):
+        load_validated_chunk(case[2], CHUNK, expected_cohort_identity=COHORT)

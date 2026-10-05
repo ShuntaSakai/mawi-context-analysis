@@ -18,7 +18,7 @@ from mawi_context.manifests import load_json_object, write_json_atomically
 from mawi_context.hashing import sha256_file
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]/'helpers'))
-from pcap_factory import packet, pcap_bytes
+from pcap_factory import packet, pcap_bytes, malformed_tcp_smoke_packet, malformed_udp_packet
 from io import BytesIO
 
 DAY='2026-04-08'; IDS=ex.expected_chunk_ids(DAY)[:4]; TARGET=IDS[0]
@@ -105,7 +105,7 @@ def test_four_chunk_failure_resume_and_portable_provenance(setup,monkeypatch):
         assert tuple(pd.read_csv(o.dataset_root/filename).columns)==columns
     fm=load_json_object(o.dataset_root/'provenance/flow_manifest.json')
     cm=load_json_object(o.dataset_root/'cohort/cohort_manifest.json')
-    assert fm['manifest_schema_version']=='flow-manifest-v1'
+    assert fm['manifest_schema_version']=='flow-manifest-v2'
     assert fm['flow_definition']==ex.FLOW_DEFINITION
     assert fm['source']['chunk_id']==TARGET
     assert cm['manifest_schema_version']=='cohort-manifest-v1'
@@ -494,3 +494,50 @@ def test_preexisting_over_capacity_mixed_failure_and_success(setup, monkeypatch)
     for chunk in ids[4:6]:
         ex.load_validated_chunk(o.dataset_root, chunk,
                                expected_cohort_identity=manifest['cohort_identity'])
+
+
+@pytest.mark.parametrize('damage', [None, 'reason', 'negative', 'bool', 'float', 'list',
+                                  'missing', 'old-flow', 'old-extraction'])
+def test_target_provenance_persists_skips_and_rejects_invalid_or_old_maps(setup, monkeypatch, damage):
+    o, calls = setup
+    body = pcap_bytes([(0, packet(), 54), (1, malformed_tcp_smoke_packet(), 86),
+                      (2, malformed_udp_packet(), 42), (3, packet(protocol=1), 42)])
+    class Response(BytesIO): headers = {}
+    monkeypatch.setattr(dl, 'urlopen', lambda *a, **kw: Response(body))
+    source, identity = ex._target_provenance(o, resolver)
+    path = o.dataset_root/'provenance/flow_manifest.json'
+    manifest = load_json_object(path)
+    assert manifest['skipped_packet_counts'] == {
+        'malformed_tcp_header_length': 1, 'malformed_udp_length': 1, 'non_tcp_udp': 1}
+    assert list(manifest['skipped_packet_counts']) == sorted(manifest['skipped_packet_counts'])
+    if damage is None:
+        assert ex._target_provenance(o, resolver) == (source, identity)
+        return
+    if damage == 'missing': manifest.pop('skipped_packet_counts')
+    elif damage == 'old-flow': manifest['manifest_schema_version'] = 'flow-manifest-v1'
+    elif damage == 'old-extraction': manifest['tool']['extraction'] = 'v1'
+    else:
+        manifest['skipped_packet_counts'] = {
+            'reason': {'unknown': 1}, 'negative': {'non_ip': -1}, 'bool': {'non_ip': True},
+            'float': {'non_ip': 1.5}, 'list': []}[damage]
+    write_json_atomically(path, manifest)
+    before = path.read_bytes(); calls.clear()
+    with pytest.raises(ValueError): ex._target_provenance(o, resolver)
+    assert path.read_bytes() == before and calls == []
+
+
+def test_run_extract_persists_same_target_and_chunk_skips(setup, monkeypatch):
+    o, calls = setup
+    body = pcap_bytes([(0, packet(), 54), (1, malformed_tcp_smoke_packet(), 86)])
+    class Response(BytesIO): headers = {}
+    monkeypatch.setattr(dl, 'urlopen', lambda *a, **kw: Response(body))
+    monkeypatch.setattr(ex, 'ProcessPoolExecutor', thread_pool_factory)
+    ex.run_extract(o, source_url_resolver=resolver)
+    fm = load_json_object(o.dataset_root/'provenance/flow_manifest.json')
+    assert fm['skipped_packet_counts'] == {'malformed_tcp_header_length': 1}
+    for chunk in IDS:
+        cm = load_json_object(o.dataset_root/'observations'/chunk/'manifest.json')
+        assert cm['skipped_packet_counts'] == fm['skipped_packet_counts']
+    calls.clear()
+    ex.run_extract(o, source_url_resolver=resolver)
+    assert calls == []

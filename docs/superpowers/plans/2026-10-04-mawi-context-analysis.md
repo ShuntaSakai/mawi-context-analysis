@@ -432,3 +432,7 @@ Compare generated `README.md`, `AGENTS.md`, manifests, schemas, and CLI behavior
 git add README.md AGENTS.md docs/benchmark.md tests/integration/test_end_to_end.py
 git commit -m "test: verify portable context analysis workflow"
 ```
+
+### Task 8 real-data validation note — 2026-10-05
+
+The human-reported laboratory smoke on `202604081400` stopped at packet `5968733` with malformed TCP Data Offset 0 despite a captured minimum TCP header (54 captured / 86 original bytes). Approved design §2.5 and §9 now define per-packet skip-and-count with durable v2 decode/provenance identity; capture container corruption remains fatal. This focused amendment is verified only with synthetic regression fixtures. No real MAWI download, smoke rerun or benchmark is performed here. Task 8B still requires laboratory validation of the amended extractor on the retained target raw and a non-target chunk, then the full-day run and measured worker benchmarks; historical checkboxes remain unchanged.

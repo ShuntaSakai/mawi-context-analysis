@@ -432,3 +432,42 @@ def test_cli_normalizes_csv_layer_failure_and_preserves_sqlite_note(
     assert 'Traceback' not in stderr
     assert snapshot(dataset) == before
     assert not list(tmp_path.rglob('context.csv'))
+
+
+@pytest.mark.parametrize('location', ['flow', 'chunk'])
+@pytest.mark.parametrize('skips', [None, [], {'unknown_reason': 1}, {'non_ip': -1},
+                                  {'non_ip': True}, {'non_ip': 1.0}, {'non_ip': '1'}])
+def test_aggregation_rejects_invalid_skip_provenance(dataset, tmp_path, location, skips):
+    path = (dataset/'provenance/flow_manifest.json' if location == 'flow'
+            else dataset/'observations'/IDS[-1]/'manifest.json')
+    manifest = load_json_object(path); manifest['skipped_packet_counts'] = skips
+    write_json_atomically(path, manifest)
+    with pytest.raises(ValueError, match='skipped_packet_counts'):
+        ag.run_aggregate(ag.AggregateOptions(dataset, tmp_path/'results'))
+    assert not (tmp_path/'results').exists()
+
+
+@pytest.mark.parametrize('location', ['flow', 'chunk', 'dataset-tool', 'cohort-tool', 'observation-identity'])
+def test_aggregation_rejects_old_semantic_identity(dataset, tmp_path, location):
+    relative = {'flow': 'provenance/flow_manifest.json',
+                'chunk': f'observations/{IDS[-1]}/manifest.json',
+                'cohort-tool': 'cohort/cohort_manifest.json'}.get(location, 'dataset_manifest.json')
+    path = dataset/relative; manifest = load_json_object(path)
+    if location in ('flow', 'chunk'):
+        manifest['manifest_schema_version'] = location+'-manifest-v1'
+    elif location == 'observation-identity': manifest['observation_schemas']['chunk_manifest'] = 'chunk-manifest-v1'
+    else: manifest['tool']['extraction'] = 'v1'
+    write_json_atomically(path, manifest)
+    with pytest.raises(ValueError):
+        ag.run_aggregate(ag.AggregateOptions(dataset, tmp_path/'results'))
+    assert not (tmp_path/'results').exists()
+
+
+def test_target_flow_and_chunk_skip_provenance_must_agree(dataset, tmp_path):
+    path = dataset/'provenance/flow_manifest.json'
+    manifest = load_json_object(path)
+    manifest['skipped_packet_counts'] = {'malformed_tcp_header_length': 1}
+    write_json_atomically(path, manifest)
+    with pytest.raises(ValueError, match='skip.*disagree'):
+        ag.run_aggregate(ag.AggregateOptions(dataset, tmp_path/'results'))
+    assert not (tmp_path/'results').exists()

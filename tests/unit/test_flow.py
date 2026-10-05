@@ -6,7 +6,7 @@ import pandas as pd
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'helpers'))
-from pcap_factory import packet, pcap_bytes, write_capture
+from pcap_factory import packet, pcap_bytes, write_capture, malformed_tcp_smoke_packet, malformed_udp_packet
 from mawi_context.capture import CaptureError
 from mawi_context.flow import Endpoint, FLOW_COLUMNS, FlowKey, PacketDecodeError, parse_target_flows
 
@@ -102,14 +102,19 @@ def test_snaplen_payload_lengths_are_declared_header_facts(tmp_path, version, pr
     assert row.transport_payload_bytes == payload_bytes
 
 
-@pytest.mark.parametrize('frame', [b'\x00'*12, packet()[:36],
-    packet()[:14]+b'\x65'+packet()[15:],
-    packet()[:16]+b'\x00\x10'+packet()[18:],
-    packet()[:46]+b'\x10'+packet()[47:],
-    packet(protocol=17)[:38]+b'\x00\x07'+packet(protocol=17)[40:]])
-def test_complete_record_with_malformed_packet_is_fatal(tmp_path, frame):
-    with pytest.raises(PacketDecodeError):
-        parse(tmp_path, [frame])
+@pytest.mark.parametrize('frame,reason', [
+    (b'\x00'*12, 'packet_header_exceeds_declared_length'),
+    (packet()[:36], 'ipv4_length_exceeds_original_frame_length'),
+    (packet()[:14]+b'\x65'+packet()[15:], 'ethernet_ip_version_mismatch'),
+    (packet()[:16]+b'\x00\x10'+packet()[18:], 'malformed_ipv4_length'),
+    (packet()[:46]+b'\x10'+packet()[47:], 'malformed_tcp_header_length'),
+    (packet(protocol=17)[:38]+b'\x00\x07'+packet(protocol=17)[40:], 'malformed_udp_length'),
+    (packet(src='::1', dst='::2')[:54], 'ipv6_length_exceeds_original_frame_length'),
+])
+def test_complete_record_with_malformed_packet_is_skipped(tmp_path, frame, reason):
+    result = parse(tmp_path, [frame])
+    assert result.frame.empty
+    assert result.skipped_packet_counts == {reason: 1}
 
 
 def test_container_failure_propagates(tmp_path):
@@ -131,14 +136,14 @@ def test_ipv6_extension_header_and_vlan(tmp_path):
 
 
 @pytest.mark.parametrize('ah_length', [8, 12])
-def test_malformed_ipv6_authentication_header_is_fatal(tmp_path, ah_length):
+def test_malformed_ipv6_authentication_header_is_skipped(tmp_path, ah_length):
     frame = packet(src='2001:db8::1', dst='2001:db8::2', protocol=17)
     ip = bytearray(frame[14:54])
     ip[4:6] = struct.pack('!H', ah_length+8)
     ip[6] = 51
     ah = bytes([17, ah_length//4-2])+b'\x00'*(ah_length-2)
-    with pytest.raises(PacketDecodeError, match='authentication'):
-        parse(tmp_path, [frame[:14]+ip+ah+frame[54:]])
+    result = parse(tmp_path, [frame[:14]+ip+ah+frame[54:]])
+    assert result.skipped_packet_counts == {'malformed_ipv6_authentication_header_length': 1}
 
 
 def test_valid_ipv6_authentication_header_payload_counter(tmp_path):
@@ -148,3 +153,63 @@ def test_valid_ipv6_authentication_header_payload_counter(tmp_path):
     ip[6] = 51
     row = parse(tmp_path, [frame[:14]+ip+bytes([17, 2])+b'\x00'*14+frame[54:]]).frame.iloc[0]
     assert (row.protocol, row.ip_bytes, row.transport_payload_bytes) == (17, 64, 0)
+
+
+@pytest.mark.parametrize('frame,original,reason', [
+    (malformed_tcp_smoke_packet(), 86, 'malformed_tcp_header_length'),
+    (malformed_udp_packet(), 42, 'malformed_udp_length'),
+])
+def test_malformed_transport_skipped_between_valid_packets(tmp_path, frame, original, reason):
+    result = parse(tmp_path, [packet(), frame, packet(flags=16)], originals=[54, original, 54])
+    assert result.skipped_packet_counts == {reason: 1}
+    row = result.frame.iloc[0]
+    assert len(result.frame) == 1
+    assert (row.packet_count, row.start_time, row.end_time) == (2, 0, 2)
+    assert (row.src_port, row.dst_port, row.initial_syn_sender_ip) == (1234, 80, '192.0.2.10')
+
+
+def test_real_smoke_structure_is_malformed_tcp_not_snaplen_skip(tmp_path):
+    from mawi_context.capture import iter_capture_records
+    from mawi_context.flow import _decode
+    frame = malformed_tcp_smoke_packet()
+    assert len(frame) == 54
+    assert frame[14] == 0x45
+    assert struct.unpack_from('!H', frame, 16)[0] == 72
+    assert struct.unpack_from('!H', frame, 20)[0] == 0x4000
+    assert frame[23] == 6
+    assert struct.unpack_from('!HH', frame, 34) == (0, 0)
+    assert frame[46:48] == b'\x00\x00'
+    path = write_capture(tmp_path/'smoke', [(1775624416.966622, frame, 86)])
+    record = next(iter_capture_records(path))
+    assert (record.captured_length, record.original_length) == (54, 86)
+    with pytest.raises(PacketDecodeError, match='malformed TCP header length') as raised:
+        _decode(record)
+    assert raised.value.reason == 'malformed_tcp_header_length'
+    assert parse_target_flows(path).skipped_packet_counts == {'malformed_tcp_header_length': 1}
+
+
+@pytest.mark.parametrize('module_name', ['flow', 'observations'])
+def test_unrelated_value_error_is_not_a_packet_skip(tmp_path, monkeypatch, module_name):
+    from mawi_context import flow, observations
+    from mawi_context.cohort import ContextIndexes
+    module = flow if module_name == 'flow' else observations
+    def fail(record):
+        raise ValueError('unrelated implementation failure')
+    monkeypatch.setattr(module, '_decode', fail)
+    path = write_capture(tmp_path/'capture', [(0, packet(), 54)])
+    with pytest.raises(ValueError, match='unrelated implementation failure'):
+        if module_name == 'flow':
+            flow.parse_target_flows(path)
+        else:
+            stage = tmp_path/'stage'; stage.mkdir()
+            observations._write_observations(path, ContextIndexes({}, frozenset()), stage)
+
+
+def test_incomplete_header_error_keeps_stable_reason_and_message():
+    from mawi_context.capture import CaptureRecord
+    from mawi_context.flow import _decode
+    # Defensive decoder branch: normal container reading guarantees frame len.
+    record = CaptureRecord(1, 0, b'\x00'*12, 54, 54)
+    with pytest.raises(PacketDecodeError, match='incomplete packet header') as raised:
+        _decode(record)
+    assert raised.value.reason == 'incomplete_packet_header'

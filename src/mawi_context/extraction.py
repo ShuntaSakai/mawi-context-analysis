@@ -22,7 +22,10 @@ from mawi_context.cohort import COHORT_COLUMNS, build_context_indexes, select_ta
 from mawi_context.downloader import download_chunk, _owned_source, _paths, _delete_owned_raw
 from mawi_context.flow import Endpoint, FLOW_COLUMNS, parse_target_flows
 from mawi_context.hashing import sha256_file
-from mawi_context.manifests import artifact_record, cohort_identity, load_json_object, write_json_atomically
+from mawi_context.manifests import (
+    artifact_record, cohort_identity, load_json_object, write_json_atomically,
+    validate_skipped_packet_counts,
+)
 from mawi_context import observations as obs
 from mawi_context.observations import RawSourceIdentity, load_validated_chunk
 
@@ -282,13 +285,14 @@ CONTEXT_SOURCE_POLICY = {
     'tcp': 'initial-plain-syn-sender-else-first-observed-src',
     'udp': 'first-observed-src',
 }
-TOOL_IDENTITY = {'name': 'mawi-context-analysis', 'version': '0.1.0', 'extraction': 'v1'}
+TOOL_IDENTITY = {'name': 'mawi-context-analysis', 'version': '0.1.0', 'extraction': 'v2'}
 
 
-def _flow_manifest(options, source, record):
-    return dict(manifest_schema_version='flow-manifest-v1', status='success',
+def _flow_manifest(options, source, record, skipped_packet_counts):
+    return dict(manifest_schema_version='flow-manifest-v2', status='success',
                 target_chunk=options.target_chunk, source=asdict(source),
-                flow_definition=FLOW_DEFINITION, tool=TOOL_IDENTITY, artifact=record)
+                flow_definition=FLOW_DEFINITION, tool=TOOL_IDENTITY, artifact=record,
+                skipped_packet_counts=validate_skipped_packet_counts(skipped_packet_counts))
 
 
 def _cohort_manifest(options, source, identity, record):
@@ -355,7 +359,7 @@ def _target_provenance(options, resolver, expected_source=None):
             identity = cohort_identity(cohort)
             if expected_source is not None and asdict(source) != expected_source:
                 raise ValueError('target provenance/prior source mismatch')
-            if (fm != _flow_manifest(options, source, fm['artifact'])
+            if (fm != _flow_manifest(options, source, fm['artifact'], fm['skipped_packet_counts'])
                     or cm != _cohort_manifest(options, source, identity, cm['artifact'])
                     or source.chunk_id != options.target_chunk
                     or source.source_url != resolver(options.day, options.target_chunk)):
@@ -371,7 +375,8 @@ def _target_provenance(options, resolver, expected_source=None):
                                 resolver(options.day, options.target_chunk), options.spool_root))
     if expected_source is not None and asdict(source) != expected_source:
         raise ValueError('target acquisition/prior source mismatch')
-    flows = parse_target_flows(_paths(options.target_chunk, options.spool_root)[0]).frame
+    parsed = parse_target_flows(_paths(options.target_chunk, options.spool_root)[0])
+    flows = parsed.frame
     root.mkdir(parents=True, exist_ok=True)
     flow_stage = Path(tempfile.mkdtemp(prefix='.provenance-', dir=root))
     cohort_stage = Path(tempfile.mkdtemp(prefix='.cohort-', dir=root))
@@ -390,7 +395,7 @@ def _target_provenance(options, resolver, expected_source=None):
         build_context_indexes(cohort)
         record = artifact_record(root, flow_stage/'flows.csv', row_count=len(flows), schema_version='flows-v1')
         record['path'] = 'provenance/flows.csv'
-        write_json_atomically(flow_stage/'flow_manifest.json', _flow_manifest(options, source, record))
+        write_json_atomically(flow_stage/'flow_manifest.json', _flow_manifest(options, source, record, parsed.skipped_packet_counts))
         record = artifact_record(root, cohort_stage/'target_cohort.csv', row_count=len(cohort), schema_version='cohort-v1')
         record['path'] = 'cohort/target_cohort.csv'
         write_json_atomically(cohort_stage/'cohort_manifest.json', _cohort_manifest(options, source, identity, record))

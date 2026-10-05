@@ -34,6 +34,14 @@ The approved design defines the research semantics. Do not let copied or histori
 - Raw extraction must not assign Scan-like, anomaly, malicious, benign, successful-connection, or similar interpretive labels.
 - Do not import Aguri, prefix-selection, Broad/Strict Scan-like removal, or unrelated experiment machinery from `mawi-global-analysis`.
 
+## Packet decode contract
+
+- Capture container corruption (`CaptureError`: PCAP/PCAPNG/gzip, record boundaries or truncated containers) remains fatal; never skip it.
+- Only `_SkipPacket` and per-packet `PacketDecodeError` are skip-and-count, identically in target flows and 24-hour observations. Never infer or repair malformed flow facts.
+- Target/cohort counts include only validly decoded TCP/UDP packets in the configured window.
+- Persist every exclusion in `skipped_packet_counts` in the target flow and each chunk manifest: allowlisted stable reason codes, nonnegative integers (not booleans), canonical sorted maps; validate strictly on reuse and aggregation.
+- Decode/provenance semantics use extraction v2, flow-manifest-v2 and chunk-manifest-v2. Reject old identities; CSV/Parquet column schemas remain unchanged.
+
 ## Observation-cache contract
 
 - Target-tuple observations retain every TCP/UDP packet matching a cohort FlowKey.

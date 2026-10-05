@@ -372,3 +372,32 @@ def test_symlink_escape_rejected(artifact, tmp_path, directory_link):
         resolve_artifact_path(root, relative)
     with pytest.raises(ValueError):
         artifact_record(root, root / relative, row_count=1, schema_version='v1')
+
+
+@pytest.mark.parametrize('reason', [
+    'non_ip', 'non_tcp_udp', 'capture_truncated_undecodable', 'ip_fragment',
+    'packet_header_exceeds_declared_length', 'incomplete_packet_header',
+    'ethernet_ip_version_mismatch', 'malformed_ipv4_length',
+    'ipv4_length_exceeds_original_frame_length', 'ipv6_length_exceeds_original_frame_length',
+    'malformed_ipv6_authentication_header_length', 'malformed_tcp_header_length', 'malformed_udp_length',
+])
+def test_skip_provenance_accepts_all_stable_reasons_including_zero(reason):
+    from mawi_context.manifests import validate_skipped_packet_counts
+    assert validate_skipped_packet_counts({reason: 0}) == {reason: 0}
+    assert validate_skipped_packet_counts({reason: 3}) == {reason: 3}
+
+
+@pytest.mark.parametrize('value', [None, [], {1: 1}, {'unknown': 1}, {'non_ip': -1},
+                                  {'non_ip': True}, {'non_ip': 1.0}, {'non_ip': '1'}])
+def test_skip_provenance_is_strict(value):
+    from mawi_context.manifests import validate_skipped_packet_counts
+    with pytest.raises(ValueError, match='skipped_packet_counts'):
+        validate_skipped_packet_counts(value)
+
+
+def test_skip_provenance_serializes_in_canonical_order(tmp_path):
+    from mawi_context.manifests import validate_skipped_packet_counts
+    a = tmp_path/'a.json'; b = tmp_path/'b.json'
+    write_json_atomically(a, {'skipped_packet_counts': validate_skipped_packet_counts({'non_ip': 2, 'ip_fragment': 1})})
+    write_json_atomically(b, {'skipped_packet_counts': validate_skipped_packet_counts({'ip_fragment': 1, 'non_ip': 2})})
+    assert a.read_bytes() == b.read_bytes()

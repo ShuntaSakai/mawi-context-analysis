@@ -1,8 +1,9 @@
 """Bounded, observational packet caches for one capture chunk.
 
-Task 2's private decoder and skip exception are deliberately shared here:
-there is one packet decoder and no change to its research semantics.
+The target decoder and explicit per-packet skip policy are shared here.
+Container failures propagate; every decode exclusion is durable provenance.
 """
+from collections import Counter
 from dataclasses import asdict, dataclass
 import ctypes
 import errno
@@ -18,16 +19,17 @@ import pyarrow.parquet as pq
 
 from mawi_context.capture import iter_capture_records
 from mawi_context.cohort import ContextIndexes
-from mawi_context.flow import FlowKey, _decode, _SkipPacket
+from mawi_context.flow import FlowKey, PacketDecodeError, _decode, _SkipPacket
 from mawi_context.hashing import sha256_file
 from mawi_context.manifests import (
     artifact_record, load_json_object, resolve_artifact_path, write_json_atomically,
+    validate_skipped_packet_counts,
 )
 
 
 TARGET_PACKET_SCHEMA_VERSION = 'target-packets-v1'
 SOURCE_CONTEXT_SCHEMA_VERSION = 'source-context-packets-v1'
-CHUNK_MANIFEST_SCHEMA_VERSION = 'chunk-manifest-v1'
+CHUNK_MANIFEST_SCHEMA_VERSION = 'chunk-manifest-v2'
 _ROW_BUFFER_LIMIT = 4096
 
 SOURCE_CONTEXT_SCHEMA = pa.schema([
@@ -59,16 +61,18 @@ def _flush(writer: pq.ParquetWriter, rows: list[dict], schema: pa.Schema) -> Non
 
 def _write_observations(
     capture_path: Path, indexes: ContextIndexes, staging: Path,
-) -> tuple[int, int]:
-    """Write only to owned staging; return logical counts after writer close."""
+) -> tuple[int, int, dict[str, int]]:
+    """Write owned staging; return retained row counts and all scan skips."""
     target_rows, source_rows = [], []
     target_count = source_count = 0
+    skipped: Counter[str] = Counter()
     with pq.ParquetWriter(staging/'target_packets.parquet', TARGET_PACKET_SCHEMA) as target_writer:
         with pq.ParquetWriter(staging/'source_context_packets.parquet', SOURCE_CONTEXT_SCHEMA) as source_writer:
             for record in iter_capture_records(capture_path):
                 try:
                     facts = _decode(record)
-                except _SkipPacket:
+                except (_SkipPacket, PacketDecodeError) as error:
+                    skipped[error.reason] += 1
                     continue
                 key = FlowKey.from_packet(facts.src_ip, facts.src_port, facts.dst_ip,
                                           facts.dst_port, facts.protocol)
@@ -104,7 +108,7 @@ def _write_observations(
                         _flush(source_writer, source_rows, SOURCE_CONTEXT_SCHEMA)
             _flush(target_writer, target_rows, TARGET_PACKET_SCHEMA)
             _flush(source_writer, source_rows, SOURCE_CONTEXT_SCHEMA)
-    return target_count, source_count
+    return target_count, source_count, dict(sorted(skipped.items()))
 
 
 def _validate_chunk_id(value: str) -> None:
@@ -174,11 +178,13 @@ def _validate_chunk(
     manifest = load_json_object(directory/'manifest.json')
     _require_keys(manifest, {
         'manifest_schema_version', 'status', 'chunk_id', 'cohort_identity', 'source', 'artifacts',
+        'skipped_packet_counts',
     }, 'chunk manifest')
     if (manifest['manifest_schema_version'] != CHUNK_MANIFEST_SCHEMA_VERSION
             or manifest['status'] != 'success' or manifest['chunk_id'] != chunk_id
             or manifest['cohort_identity'] != expected_cohort_identity):
         raise ValueError('chunk version/status/identity mismatch')
+    validate_skipped_packet_counts(manifest['skipped_packet_counts'])
     _require_keys(manifest['source'], {'chunk_id', 'source_url', 'sha256', 'size_bytes'}, 'raw source')
     source = RawSourceIdentity(**manifest['source'])
     if source.chunk_id != chunk_id or (expected_source is not None and source != expected_source):
@@ -253,7 +259,7 @@ def _publish_chunk(staging: Path, destination: Path) -> None:
 
 def _staged_manifest(
     dataset_root: Path, staging: Path, chunk_id: str, source: RawSourceIdentity,
-    cohort_identity_value: str, counts: tuple[int, int],
+    cohort_identity_value: str, counts: tuple[int, int, dict[str, int]],
 ) -> dict[str, object]:
     artifacts = {}
     for name, count, version in (
@@ -268,7 +274,8 @@ def _staged_manifest(
         artifacts[name] = record
     return dict(manifest_schema_version=CHUNK_MANIFEST_SCHEMA_VERSION,
                 status='success', chunk_id=chunk_id, cohort_identity=cohort_identity_value,
-                source=asdict(source), artifacts=artifacts)
+                source=asdict(source), artifacts=artifacts,
+                skipped_packet_counts=validate_skipped_packet_counts(counts[2]))
 
 
 def extract_chunk_observations(

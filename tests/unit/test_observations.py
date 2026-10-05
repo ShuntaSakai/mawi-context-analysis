@@ -8,11 +8,11 @@ import pyarrow.parquet as pq
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'helpers'))
-from pcap_factory import packet, pcap_bytes, write_capture
+from pcap_factory import packet, pcap_bytes, write_capture, malformed_tcp_smoke_packet, malformed_udp_packet
 from mawi_context import observations as obs
 from mawi_context.capture import CaptureError
 from mawi_context.cohort import ContextIndexes
-from mawi_context.flow import FlowKey, PacketDecodeError, parse_target_flows
+from mawi_context.flow import FlowKey, parse_target_flows
 
 A, B, C = '192.0.2.10', '192.0.2.2', '198.51.100.1'
 FIELDS = [
@@ -42,7 +42,7 @@ def write_rows(tmp_path, frames, *, lookup=None, originals=None, timestamps=None
     counts = obs._write_observations(capture, lookup or indexes(), stage)
     target = pq.read_table(stage/'target_packets.parquet')
     source = pq.read_table(stage/'source_context_packets.parquet')
-    assert counts == (target.num_rows, source.num_rows)
+    assert counts[:2] == (target.num_rows, source.num_rows)
     return target, source
 
 
@@ -155,14 +155,12 @@ def test_bounded_buffers_write_multiple_row_groups_and_decode_once(tmp_path, mon
         assert [metadata.row_group(i).num_rows for i in range(3)] == [3, 3, 2]
 
 
-@pytest.mark.parametrize('kind', ['packet', 'container'])
-def test_malformed_complete_packet_or_late_container_is_fatal(tmp_path, kind):
+def test_late_container_is_fatal(tmp_path):
     capture = tmp_path/'bad'
-    capture.write_bytes(pcap_bytes([(1, packet(), 54)]) + b'broken' if kind == 'container'
-                        else pcap_bytes([(1, b'\x00'*12, 12)]))
+    capture.write_bytes(pcap_bytes([(1, packet(), 54)]) + b'broken')
     stage = tmp_path/'stage'
     stage.mkdir()
-    with pytest.raises(CaptureError if kind == 'container' else PacketDecodeError):
+    with pytest.raises(CaptureError):
         obs._write_observations(capture, indexes(), stage)
 
 
@@ -188,3 +186,22 @@ def test_ipv6_vlan_extensions_share_task2_length_and_tuple_semantics(tmp_path):
     assert (row['ip_version'], row['ip_total_length'], row['transport_payload_length']) == (6, 58, 2)
     assert (row['ip_total_length'], row['transport_payload_length']) == (flow.ip_bytes, flow.transport_payload_bytes)
     assert source.num_rows == 1
+
+
+@pytest.mark.parametrize('frame,original,reason', [
+    (malformed_tcp_smoke_packet(), 86, 'malformed_tcp_header_length'),
+    (malformed_udp_packet(), 42, 'malformed_udp_length'),
+])
+def test_target_and_observation_decode_policy_and_counts_match(tmp_path, frame, original, reason):
+    capture = write_capture(tmp_path/'mixed', [(0, packet(), 54), (1, frame, original),
+        (2, packet(protocol=1), 42), (3, packet()[:36], 54),
+        (4, packet(fragment=0x2000), 54), (5, b'\x00'*12+b'\x08\x06', 14),
+        (6, packet(flags=16), 54)])
+    stage = tmp_path/'stage'; stage.mkdir()
+    counts = obs._write_observations(capture, indexes(), stage)
+    expected = {reason: 1, 'non_tcp_udp': 1, 'capture_truncated_undecodable': 1,
+                'ip_fragment': 1, 'non_ip': 1}
+    assert counts == (2, 1, expected)
+    assert parse_target_flows(capture).skipped_packet_counts == expected
+    assert pq.read_table(stage/'target_packets.parquet')['packet_index'].to_pylist() == [1, 7]
+    assert pq.read_table(stage/'source_context_packets.parquet')['packet_index'].to_pylist() == [1]
