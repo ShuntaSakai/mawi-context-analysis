@@ -9,6 +9,7 @@ from collections.abc import Callable
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, ThreadPoolExecutor, wait
 from dataclasses import asdict, dataclass
 import ipaddress
+import multiprocessing
 import os
 from pathlib import Path
 import shutil
@@ -520,6 +521,7 @@ def run_extract(
     progress()
     with ThreadPoolExecutor(max_workers=2) as downloads:
         with ProcessPoolExecutor(max_workers=options.workers, initializer=_initialize_scan_worker,
+                                 mp_context=multiprocessing.get_context('spawn'),
                                  initargs=(str(options.dataset_root/'cohort/target_cohort.csv'),)) as scans:
             _schedule_chunks(options, ids, identity, states, progress, source_url_resolver, downloads, scans)
     progress()

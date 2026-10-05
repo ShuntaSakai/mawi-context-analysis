@@ -41,9 +41,33 @@ def setup(tmp_path, monkeypatch):
 def resolver(day, chunk): return 'https://fixture.test/'+chunk
 
 
+def thread_pool_factory(*args, **kwargs):
+    """Adapt synthetic scan pools to the production process-pool interface."""
+    kwargs.pop('mp_context', None)
+    return ThreadPoolExecutor(*args, **kwargs)
+
+
+def test_run_extract_uses_explicit_spawn_context(setup, monkeypatch):
+    options, _ = setup
+    pool_calls = []
+
+    def scan_pool_factory(*args, **kwargs):
+        pool_calls.append(kwargs.copy())
+        assert 'mp_context' in kwargs, 'scan pool must receive an explicit spawn context'
+        assert kwargs.pop('mp_context').get_start_method() == 'spawn'
+        return ThreadPoolExecutor(*args, **kwargs)
+
+    monkeypatch.setattr(ex, 'ProcessPoolExecutor', scan_pool_factory)
+    assert ex.run_extract(options, source_url_resolver=resolver) == options.dataset_root
+    assert len(pool_calls) == 1
+    assert pool_calls[0]['max_workers'] == options.workers
+    assert pool_calls[0]['initializer'] is ex._initialize_scan_worker
+    assert pool_calls[0]['initargs'] == (str(options.dataset_root/'cohort/target_cohort.csv'),)
+
+
 def test_four_chunk_failure_resume_and_portable_provenance(setup,monkeypatch):
     o,downloads=setup
-    monkeypatch.setattr(ex,'ProcessPoolExecutor',ThreadPoolExecutor)
+    monkeypatch.setattr(ex,'ProcessPoolExecutor',thread_pool_factory)
     scan=ex._scan_chunk_worker; scanned=[]; spans=[]; lock=threading.Lock(); fail=True
     def worker(task):
         start=time.monotonic()
@@ -132,7 +156,7 @@ def test_spawn_workers_initialized_and_overlap(setup):
 
 @pytest.mark.parametrize('damage', ['csv','columns','row_count','version','counts','policy','source','dataset','cohort-id'])
 def test_corrupt_provenance_fails_without_overwrite(setup,monkeypatch,damage):
-    o,calls=setup; monkeypatch.setattr(ex,'ProcessPoolExecutor',ThreadPoolExecutor)
+    o,calls=setup; monkeypatch.setattr(ex,'ProcessPoolExecutor',thread_pool_factory)
     ex.run_extract(o,source_url_resolver=resolver)
     flow=o.dataset_root/'provenance/flow_manifest.json'; cohort=o.dataset_root/'cohort/cohort_manifest.json'
     fm=load_json_object(flow); cm=load_json_object(cohort)
@@ -169,7 +193,7 @@ def test_target_acquisition_failure_is_durable_incomplete(setup,monkeypatch):
 
 def test_failure_before_target_scan_reuses_provenance_and_checks_raw_source(setup,monkeypatch):
     o,calls=setup
-    monkeypatch.setattr(ex,'ProcessPoolExecutor',ThreadPoolExecutor)
+    monkeypatch.setattr(ex,'ProcessPoolExecutor',thread_pool_factory)
     scan=ex._scan_chunk_worker
     def fail_target(task):
         if task.chunk_id==TARGET: raise ValueError('failed target scan')
@@ -188,7 +212,7 @@ def test_failure_before_target_scan_reuses_provenance_and_checks_raw_source(setu
 
 
 def test_initializer_once_and_worker_ownership(setup,monkeypatch):
-    o,calls=setup; monkeypatch.setattr(ex,'ProcessPoolExecutor',ThreadPoolExecutor)
+    o,calls=setup; monkeypatch.setattr(ex,'ProcessPoolExecutor',thread_pool_factory)
     ex.run_extract(o,source_url_resolver=resolver)
     cm=load_json_object(o.dataset_root/'cohort/cohort_manifest.json')
     reads=[]; read=ex._read_csv
@@ -207,7 +231,7 @@ def test_initializer_once_and_worker_ownership(setup,monkeypatch):
 
 
 def test_invalid_final_is_reported_and_never_overwritten(setup,monkeypatch):
-    o,calls=setup;monkeypatch.setattr(ex,'ProcessPoolExecutor',ThreadPoolExecutor)
+    o,calls=setup;monkeypatch.setattr(ex,'ProcessPoolExecutor',thread_pool_factory)
     ex.run_extract(o,source_url_resolver=resolver)
     p=o.dataset_root/'observations'/IDS[2]/'target_packets.parquet';p.write_bytes(b'broken')
     before=p.read_bytes();calls.clear()
@@ -221,7 +245,7 @@ def test_invalid_final_is_reported_and_never_overwritten(setup,monkeypatch):
 
 def test_target_invalid_cache_does_not_block_independent_missing_chunk(setup,monkeypatch):
     import shutil
-    o,calls=setup;monkeypatch.setattr(ex,'ProcessPoolExecutor',ThreadPoolExecutor)
+    o,calls=setup;monkeypatch.setattr(ex,'ProcessPoolExecutor',thread_pool_factory)
     ex.run_extract(o,source_url_resolver=resolver)
     bad=o.dataset_root/'observations'/TARGET/'target_packets.parquet';bad.write_bytes(b'bad')
     shutil.rmtree(o.dataset_root/'observations'/IDS[-1]);calls.clear()
@@ -233,7 +257,7 @@ def test_target_invalid_cache_does_not_block_independent_missing_chunk(setup,mon
 
 
 def test_cache_reuses_without_raw_after_interrupted_metadata_deletion(setup,monkeypatch):
-    o,calls=setup;monkeypatch.setattr(ex,'ProcessPoolExecutor',ThreadPoolExecutor)
+    o,calls=setup;monkeypatch.setattr(ex,'ProcessPoolExecutor',thread_pool_factory)
     ex.run_extract(o,source_url_resolver=resolver)
     for c in IDS:
         source=load_json_object(o.dataset_root/'observations'/c/'manifest.json')['source']
@@ -254,14 +278,14 @@ def test_failed_second_provenance_publication_rolls_back_owned_first(setup,monke
     assert not (o.dataset_root/'cohort').exists()
     assert (o.spool_root/f'{TARGET}.pcap.gz').exists()
     monkeypatch.setattr(ex.obs,'_publish_chunk',publish)
-    monkeypatch.setattr(ex,'ProcessPoolExecutor',ThreadPoolExecutor)
+    monkeypatch.setattr(ex,'ProcessPoolExecutor',thread_pool_factory)
     assert ex.run_extract(o,source_url_resolver=resolver)==o.dataset_root
 
 
 @pytest.mark.parametrize('damage',['digest','null-identity','bool-count','bool-row-count','observations-symlink'])
 def test_malformed_identity_or_paths_fail_before_writing(setup,monkeypatch,damage):
     import shutil
-    o,calls=setup;monkeypatch.setattr(ex,'ProcessPoolExecutor',ThreadPoolExecutor)
+    o,calls=setup;monkeypatch.setattr(ex,'ProcessPoolExecutor',thread_pool_factory)
     ex.run_extract(o,source_url_resolver=resolver)
     manifest=o.dataset_root/'dataset_manifest.json';value=load_json_object(manifest)
     if damage=='digest': value['cohort_identity']='not-a-digest'
@@ -287,7 +311,7 @@ def test_malformed_identity_or_paths_fail_before_writing(setup,monkeypatch,damag
 
 def test_target_reacquisition_failure_continues_safe_siblings(setup,monkeypatch):
     import shutil
-    o,calls=setup;monkeypatch.setattr(ex,'ProcessPoolExecutor',ThreadPoolExecutor)
+    o,calls=setup;monkeypatch.setattr(ex,'ProcessPoolExecutor',thread_pool_factory)
     ex.run_extract(o,source_url_resolver=resolver)
     for c in (TARGET,IDS[-1]):shutil.rmtree(o.dataset_root/'observations'/c)
     download=ex.download_chunk
@@ -317,7 +341,7 @@ def test_preprovenance_resume_preserves_known_target_source(setup,monkeypatch):
 
 def test_complete_copy_reuses_without_original_roots_or_raw(setup,monkeypatch):
     import shutil
-    o,calls=setup;monkeypatch.setattr(ex,'ProcessPoolExecutor',ThreadPoolExecutor)
+    o,calls=setup;monkeypatch.setattr(ex,'ProcessPoolExecutor',thread_pool_factory)
     ex.run_extract(o,source_url_resolver=resolver)
     copied=o.dataset_root.parent/'copied';shutil.copytree(o.dataset_root,copied);shutil.rmtree(o.dataset_root);shutil.rmtree(o.spool_root)
     options=ex.ExtractOptions(DAY,TARGET,(1,2,3),2,copied,copied.parent/'new-spool');calls.clear()
@@ -327,7 +351,7 @@ def test_complete_copy_reuses_without_original_roots_or_raw(setup,monkeypatch):
 
 @pytest.mark.parametrize('damage',['duplicate-id','protocol','ip','port','ip-version','bool-cohort-count'])
 def test_all_flow_semantic_identifiers_are_validated(setup,monkeypatch,damage):
-    o,calls=setup;monkeypatch.setattr(ex,'ProcessPoolExecutor',ThreadPoolExecutor)
+    o,calls=setup;monkeypatch.setattr(ex,'ProcessPoolExecutor',thread_pool_factory)
     frames=[packet()]+[packet(src='192.0.2.44',sport=5000)]*4
     body=pcap_bytes([(i,frame,len(frame)) for i,frame in enumerate(frames)])
     class Response(BytesIO):headers={}
@@ -345,7 +369,7 @@ def test_all_flow_semantic_identifiers_are_validated(setup,monkeypatch,damage):
 
 
 def test_worker_rejects_indexes_from_changed_cohort(setup,monkeypatch):
-    o,calls=setup;monkeypatch.setattr(ex,'ProcessPoolExecutor',ThreadPoolExecutor)
+    o,calls=setup;monkeypatch.setattr(ex,'ProcessPoolExecutor',thread_pool_factory)
     ex.run_extract(o,source_url_resolver=resolver)
     path=o.dataset_root/'cohort/target_cohort.csv';cm=load_json_object(path.parent/'cohort_manifest.json')
     frame=pd.read_csv(path);frame.loc[0,'context_source_ip']='192.0.2.99';frame.to_csv(path,index=False)
@@ -370,7 +394,7 @@ def test_malformed_preprovenance_progress_is_explicit_failure(setup,monkeypatch,
 
 
 def test_cohort_observation_times_match_flows_exactly(setup,monkeypatch):
-    o,calls=setup;monkeypatch.setattr(ex,'ProcessPoolExecutor',ThreadPoolExecutor)
+    o,calls=setup;monkeypatch.setattr(ex,'ProcessPoolExecutor',thread_pool_factory)
     ex.run_extract(o,source_url_resolver=resolver)
     p=o.dataset_root/'cohort/target_cohort.csv';frame=pd.read_csv(p)
     frame.loc[0,'target_start_time']+=1e-8;frame.to_csv(p,index=False)
@@ -384,7 +408,7 @@ def test_capacity_exhaustion_is_incomplete_and_resume_drains_raw(setup, monkeypa
     o, downloads = setup
     ids = expected_chunk_ids(DAY)[:10]
     monkeypatch.setattr(ex, 'expected_chunk_ids', lambda day: ids)
-    monkeypatch.setattr(ex, 'ProcessPoolExecutor', ThreadPoolExecutor)
+    monkeypatch.setattr(ex, 'ProcessPoolExecutor', thread_pool_factory)
     scan = ex._scan_chunk_worker
     scanned = []
     def fail(task):
@@ -439,7 +463,7 @@ def test_preexisting_over_capacity_mixed_failure_and_success(setup, monkeypatch)
     o, downloads = setup
     ids = expected_chunk_ids(DAY)[:7]
     monkeypatch.setattr(ex, 'expected_chunk_ids', lambda day: ids)
-    monkeypatch.setattr(ex, 'ProcessPoolExecutor', ThreadPoolExecutor)
+    monkeypatch.setattr(ex, 'ProcessPoolExecutor', thread_pool_factory)
     # Create reusable target provenance and six captures, as an older run or
     # recovery could leave them. The seventh capture remains missing.
     ex._target_provenance(o, resolver)

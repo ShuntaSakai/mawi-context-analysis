@@ -31,6 +31,12 @@ IDS = expected_chunk_ids(DAY)
 TARGET = IDS[56]
 
 
+def thread_pool_factory(*args, **kwargs):
+    """Adapt synthetic scan pools to the production process-pool interface."""
+    kwargs.pop('mp_context', None)
+    return ThreadPoolExecutor(*args, **kwargs)
+
+
 def snapshot(root):
     return {p.relative_to(root).as_posix(): p.read_bytes() for p in root.rglob('*') if p.is_file()}
 
@@ -67,7 +73,7 @@ def complete_dataset(tmp_path_factory):
         headers = {}
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(dl, 'urlopen', lambda url,timeout: Response(bodies.get(url.rsplit('/',1)[-1],pcap_bytes())))
-        patch.setattr(ex, 'ProcessPoolExecutor', ThreadPoolExecutor)
+        patch.setattr(ex, 'ProcessPoolExecutor', thread_pool_factory)
         ex.run_extract(options,source_url_resolver=lambda day,chunk:'https://fixture.test/'+chunk)
     assert load_json_object(options.dataset_root/'dataset_manifest.json')['status'] == 'success'
     assert len(list((options.dataset_root/'observations').iterdir())) == 96
@@ -272,7 +278,7 @@ def test_other_packet_counts_and_header_only_groups(tmp_path,monkeypatch,counts)
     body=pcap_bytes((1000+i,frame,len(frame)) for i in range(4))
     class Response(BytesIO): headers={}
     monkeypatch.setattr(dl,'urlopen',lambda url,timeout:Response(body if 4 in counts and url.endswith(TARGET) else pcap_bytes()))
-    monkeypatch.setattr(ex,'ProcessPoolExecutor',ThreadPoolExecutor)
+    monkeypatch.setattr(ex,'ProcessPoolExecutor',thread_pool_factory)
     ex.run_extract(options,source_url_resolver=lambda day,chunk:'https://fixture.test/'+chunk)
     output=ag.run_aggregate(ag.AggregateOptions(options.dataset_root,tmp_path/'results'))
     assert {p.name for p in output.iterdir()}=={f'packet_count_{n}' for n in counts}
@@ -298,7 +304,7 @@ def test_capture_order_timestamps_preserved_and_only_selected_reversed_interval_
     body=pcap_bytes([(1000.125,frame,len(frame)),(999.125,frame,len(frame))])
     class Response(BytesIO): headers={}
     monkeypatch.setattr(dl,'urlopen',lambda url,timeout:Response(body if url.endswith(TARGET) else pcap_bytes()))
-    monkeypatch.setattr(ex,'ProcessPoolExecutor',ThreadPoolExecutor)
+    monkeypatch.setattr(ex,'ProcessPoolExecutor',thread_pool_factory)
     ex.run_extract(options,source_url_resolver=lambda day,chunk:'https://fixture.test/'+chunk)
     before=snapshot(options.dataset_root)
     output=tmp_path/'results'
