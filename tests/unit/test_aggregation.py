@@ -156,3 +156,15 @@ def test_result_rows_sort_by_id_and_filter_count():
         assert [r[0] for r in ag._result_rows(db)]==[2,5,9]
         assert [r[0] for r in ag._result_rows(db,1)]==[2,9]
         assert list(ag._result_rows(db,99))==[]
+
+
+@pytest.mark.parametrize('signal', [KeyboardInterrupt('interrupted'), SystemExit(7)])
+def test_cli_propagates_process_control_exceptions(monkeypatch, capsys, signal):
+    import argparse
+    def interrupted(options):
+        raise signal
+    monkeypatch.setattr(ag, 'run_aggregate', interrupted)
+    with pytest.raises(type(signal)) as raised:
+        ag.run_aggregate_cli(argparse.Namespace(dataset='unused'))
+    assert raised.value is signal
+    assert capsys.readouterr().err == ''

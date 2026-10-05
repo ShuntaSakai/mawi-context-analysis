@@ -453,7 +453,9 @@ def run_aggregate_cli(args: argparse.Namespace) -> int:
     try:
         run_aggregate(AggregateOptions(Path(args.dataset)))
         return 0
-    except (ValueError, OSError, sqlite3.Error) as error:
+    except Exception as error:
+        # Normalize library failures at the CLI boundary; process-control
+        # BaseExceptions still propagate, and run_aggregate keeps raising.
         print(f'aggregate failed: {error}',file=sys.stderr)
         for note in getattr(error,'__notes__',()):
             print(note,file=sys.stderr)

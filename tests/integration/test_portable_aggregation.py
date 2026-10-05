@@ -354,3 +354,75 @@ def test_source_rows_must_obey_existing_retention_policy(dataset,tmp_path,bad):
     assert snapshot(dataset)==before
     assert len(list((tmp_path/'results').glob('*.sqlite')))==1
     assert not list((tmp_path/'results').rglob('context.csv'))
+
+
+@pytest.mark.parametrize('decoder_error', [None, pa.ArrowNotImplementedError, pa.ArrowTypeError])
+def test_cli_normalizes_checksum_consistent_corrupt_parquet(
+    dataset, tmp_path, monkeypatch, capsys, decoder_error,
+):
+    path = dataset/'observations'/TARGET/'target_packets.parquet'
+    path.write_bytes(b'invalid parquet bytes')
+    manifest_path = path.parent/'manifest.json'
+    manifest = load_json_object(manifest_path)
+    manifest['artifacts']['target_packets']['sha256'] = sha256_file(path)
+    write_json_atomically(manifest_path, manifest)
+    before = snapshot(dataset)
+    monkeypatch.chdir(tmp_path)
+    # This runtime reports corrupt bytes as ArrowInvalid (a ValueError).
+    # Exercise other Arrow decoder exception families at the same read boundary
+    # without replacing the real dataset/checksum/provenance validation.
+    if decoder_error is not None:
+        parquet_file = pq.ParquetFile
+        def decode(*args, **kwargs):
+            try:
+                return parquet_file(*args, **kwargs)
+            except pa.ArrowInvalid as error:
+                raise decoder_error('invalid Parquet decoding') from error
+        monkeypatch.setattr(pq, 'ParquetFile', decode)
+    # Failure normalization must not trigger acquisition or network fallback.
+    fallback_calls = []
+    def fallback(*args, **kwargs):
+        fallback_calls.append(args)
+        raise RuntimeError('acquisition/network fallback forbidden')
+    monkeypatch.setattr(ex, 'run_extract', fallback)
+    monkeypatch.setattr(ex, 'download_chunk', fallback)
+    monkeypatch.setattr(dl, 'urlopen', fallback)
+    monkeypatch.setattr(socket, 'create_connection', fallback)
+    monkeypatch.setattr(urllib.request, 'urlopen', fallback)
+    args = argparse.Namespace(dataset=str(dataset))
+    result = ag.run_aggregate_cli(args)
+    assert isinstance(result, int) and result != 0
+    assert fallback_calls == []
+    stderr = capsys.readouterr().err
+    assert stderr.startswith('aggregate failed:')
+    assert 'Traceback' not in stderr
+    assert snapshot(dataset) == before
+    assert not list(tmp_path.rglob('context.csv'))
+    assert not (tmp_path/'results').exists()
+
+
+def test_cli_normalizes_csv_layer_failure_and_preserves_sqlite_note(
+    dataset, tmp_path, monkeypatch, capsys,
+):
+    before = snapshot(dataset)
+    monkeypatch.chdir(tmp_path)
+    def fail(*args):
+        raise csv.Error('injected CSV publication failure')
+    monkeypatch.setattr(ag, '_write_result_group', fail)
+    # The library API continues raising the original ordinary exception.
+    with pytest.raises(csv.Error) as raised:
+        ag.run_aggregate(ag.AggregateOptions(dataset, tmp_path/'library-results'))
+    assert any('aggregation diagnostic SQLite retained at' in note
+               for note in raised.value.__notes__)
+    assert len(list((tmp_path/'library-results').glob('*.sqlite'))) == 1
+    args = argparse.Namespace(dataset=str(dataset))
+    result = ag.run_aggregate_cli(args)
+    assert isinstance(result, int) and result != 0
+    stderr = capsys.readouterr().err
+    assert 'aggregate failed: injected CSV publication failure' in stderr
+    databases = list((tmp_path/'results'/TARGET).glob('*.sqlite'))
+    assert len(databases) == 1
+    assert f'aggregation diagnostic SQLite retained at {databases[0]}' in stderr
+    assert 'Traceback' not in stderr
+    assert snapshot(dataset) == before
+    assert not list(tmp_path.rglob('context.csv'))
