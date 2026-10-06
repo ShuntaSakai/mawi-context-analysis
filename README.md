@@ -39,12 +39,12 @@ uv run mawi-context extract \
   --day 2026-04-08 \
   --target-chunk 202604081400 \
   --packet-counts 1 2 3 \
-  --workers 16
+  --workers 1
 ```
 
 この処理では、target 15 分 flow/cohort の生成、24 時間 96 chunk の取得、chunk 単位の並列 scan、Parquet cache の検証、検証済み raw PCAP の削除までを行います。
 
-`16` は command の例示です。実MAWI benchmark はまだ未実施で、recommended worker count は **TBD** です。研究室 Ubuntu server での実測後に決定します。
+`1` は benchmark の一条件の例示です。184 GiB 研究室 Ubuntu server では real memory probe に基づき、現 indexing architecture の full-day 比較を workers `1` / `2` に限定します。Workers ≥3 は memory-gated で実行しません。Recommended workers は両条件の full-day 実測後に決めるため **TBD** です。
 
 Default paths は実行時の working directory を基準とします。
 
@@ -131,7 +131,7 @@ uv run pytest tests/integration/test_end_to_end.py -v
 uv run pytest -q
 ```
 
-この検証は synthetic validation です。**実MAWIの real-data smoke と 24 時間 benchmark はまだ未実施**です。Review/push 後の Task 8B で、[laboratory benchmark runbook](docs/benchmark.md) に従い、同一 raw baseline と fresh dataset を用いて workers `1, 4, 8, 16, 32` を比較します。Measurement date と recommended workers はともに **TBD** です。
+この automated 検証は synthetic validation です。研究室の **real MAWI extraction v2 smoke は 2026-10-05 に PASSED**（target `202604081400` / non-target `202604081345`、2/96 success・94 pending・incomplete は意図通り）。**Full 24-hour benchmark は未実施**です。[Laboratory benchmark runbook](docs/benchmark.md) に従い、同一 validated raw baseline と fresh datasets で workers `1` vs `2` を比較します。Workers `3/4/8/16/32` は memory-gated / not executed で、measured failures ではありません。Full-day measurement date と recommended workers は **TBD**、Task 8B は未完了です。
 
 ## セットアップ
 
@@ -152,7 +152,7 @@ uv sync
 | `tests/integration/` | cache publication、resume、portable aggregation、end-to-end validation |
 | `docs/superpowers/specs/` | 承認済み設計仕様書 |
 | `docs/superpowers/plans/` | 実装計画書 |
-| `docs/benchmark.md` | 未実施の real-data smoke / 研究室 benchmark 手順と実測記録欄 |
+| `docs/benchmark.md` | Real V2 smoke / memory evidence、workers 1/2 full-day benchmark 手順と記録欄 |
 | `notebooks/` | 後段の研究分析・可視化 |
 | `data/` | portable dataset と transient spool。大容量データ本体は Git 管理外 |
 | `results/` | 再生成可能な 1 / 2 / 3 packet context CSV と解析結果 |

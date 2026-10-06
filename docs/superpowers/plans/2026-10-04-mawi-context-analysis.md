@@ -401,6 +401,10 @@ git commit -m "feat: add portable 24 hour context aggregation"
 - Consumes: complete `extract` and `aggregate` CLI from Tasks 1–7.
 - Produces: documented real-data benchmark procedure for worker counts `1, 4, 8, 16, 32` and a place to record the selected recommendation.
 
+**Task 8B execution amendment:** The 2026-10-05 real-data evidence note below supersedes the
+original worker grid in this historical Task 8 text. On the current 184 GiB machine, execute
+only workers `1` and `2`; workers `3/4/8/16/32` are memory-gated / not executed.
+
 - [ ] **Step 1: Add a synthetic end-to-end acceptance test**
 
 Run target flow extraction → cohort → multi-chunk extraction → portable copy → aggregate on tiny generated PCAPs. Assert no Scan-like labels occur, all durable paths are relative, valid caches are reused on rerun, and 1/2/3 result schemas match.
@@ -436,3 +440,31 @@ git commit -m "test: verify portable context analysis workflow"
 ### Task 8 real-data validation note — 2026-10-05
 
 The human-reported laboratory smoke on `202604081400` stopped at packet `5968733` with malformed TCP Data Offset 0 despite a captured minimum TCP header (54 captured / 86 original bytes). Approved design §2.5 and §9 now define per-packet skip-and-count with durable v2 decode/provenance identity; capture container corruption remains fatal. This focused amendment is verified only with synthetic regression fixtures. No real MAWI download, smoke rerun or benchmark is performed here. Task 8B still requires laboratory validation of the amended extractor on the retained target raw and a non-target chunk, then the full-day run and measured worker benchmarks; historical checkboxes remain unchanged.
+
+### Task 8B real-data evidence and memory gate — smoke 2026-10-05
+
+This note updates the preceding historical validation status using human-provided laboratory
+evidence; no real-data rerun is performed during this documentation update. Extraction v2
+smoke **PASSED** on real `202604081400` and `202604081345`: 2/96 success, 94 pending,
+0 failed, dataset `incomplete` by design. Target flow and target observation skip counts
+matched exactly; malformed skip provenance was validated in both chunks. Both chunks
+completed parent final reload validation before owned raw deletion.
+
+A dedicated `spawn` one-worker production `_initialize_scan_worker()` probe read the real
+`5,443,849,557`-byte cohort CSV: initialized VmRSS `24,519,028 kB` (about 23.4 GiB),
+VmHWM / `ru_maxrss` / GNU time max RSS `63,162,888 kB` (about 60.2 GiB), elapsed
+`48:49.82`, exit 0, swaps 0. On 184 GiB RAM, the original `1/4/8/16/32` benchmark grid
+is unsafe with current per-spawn-worker Python `ContextIndexes` replication. One-worker
+projections put 3-worker transient memory near 181 GiB, 4 near 241 GiB, and even 8-worker
+steady memory near 187 GiB, before parent/OS/page cache. These are resource projections,
+not actual multi-worker memory measurements or measured benchmark failures.
+
+The revised safe full-day comparison is **workers 1 vs 2**, using the same immutable
+validated raw baseline and fresh datasets, subject to storage/resource gates in
+[the runbook](../../benchmark.md). Two-worker real smoke succeeded, but full-day runs
+remain **Not yet run** and recommended workers **TBD** until measured wall time/resource
+pressure can be compared. Workers `3/4/8/16/32` remain memory-gated / not executed;
+higher concurrency requires future compact/shared index architecture work, not completed
+benchmark conditions. No shared-memory/mmap redesign is implemented here. The observed
+limit is the current index representation, not a demonstrated CPU-core or intrinsic MAWI
+limit. Task 8B remains incomplete; historical tasks and checkboxes are unchanged.
