@@ -122,6 +122,16 @@ Application payload bytes 自体は保存しません。
 
 `tcp_flags_raw` を canonical TCP flag fact として保存し、flag に基づく集約値は後段で計算します。
 
+## Classic PCAP の snaplen 不整合
+
+Classic PCAP は、完全な record body と `caplen <= original` を確認して、宣言 snaplen を
+超える record も実際の `caplen` のまま読み込みます。新たに許容する超過 record は
+16 MiB 以下に制限します。PCAPNG の厳格な snaplen 検証は維持します。
+Extraction identity は `v2` のまま、成功済み cache と flow/cohort を既存の厳密検証で
+再利用します。正確な新旧 parser revision は dataset 外の audit bundle に記録します。
+[94 chunk を維持した2 chunkの復旧手順](docs/classic-pcap-recovery.md) は本番実行前の確認、
+実行 path、raw 削除条件、失敗時の対応を説明しています。本修正の検証は synthetic のみです。
+
 ## 検証と benchmark 状態
 
 Task 1〜7 の automated tests に加え、[synthetic CLI E2E acceptance test](tests/integration/test_end_to_end.py) が production の 96 chunk contract を検証します。Tiny synthetic PCAP と fake HTTP response を使い、extract → shared cohort/cache → valid-cache rerun → portable copy → original dataset/raw/spool removal → aggregate → 1/2/3 CSV までを通します。実 process workers を使い、schema・代表値・relative paths・解釈ラベルの不在・dataset bytes の不変性も確認します。

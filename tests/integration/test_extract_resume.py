@@ -1,10 +1,12 @@
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import asdict
+import gzip
 import json
 import multiprocessing
 import os
 from pathlib import Path
 import sys
+import struct
 import threading
 import time
 
@@ -12,6 +14,7 @@ import pandas as pd
 import pytest
 import mawi_context.extraction as ex
 import mawi_context.downloader as dl
+import mawi_context.capture as capture
 from mawi_context.cohort import COHORT_COLUMNS
 from mawi_context.flow import FLOW_COLUMNS
 from mawi_context.manifests import load_json_object, write_json_atomically
@@ -541,3 +544,121 @@ def test_run_extract_persists_same_target_and_chunk_skips(setup, monkeypatch):
     calls.clear()
     ex.run_extract(o, source_url_resolver=resolver)
     assert calls == []
+
+
+def test_snaplen_recovery_reuses_94_strict_v2_chunks_and_scans_only_two(tmp_path, monkeypatch):
+    """Old success evidence stays immutable; only failed raw gets the new reader."""
+    ids = ex.expected_chunk_ids(DAY)
+    failed = {'202604081430', '202604082130'}
+    options = ex.ExtractOptions(DAY, '202604081400', (1, 2, 3), 1,
+                                tmp_path/'dataset', tmp_path/'spool')
+    normal = pcap_bytes([(1, packet(), 54), (2, packet(protocol=17), 42)], snaplen=96)
+    overrun = pcap_bytes([
+        (10.125, packet(payload=b'x'*1154)[:182], 1208),
+        (11.5, packet(protocol=17, payload=b'x'*1230)[:118], 1272),
+        (12, malformed_tcp_smoke_packet(), 86),
+        (500.5, packet(flags=16), 54),
+    ], snaplen=96)
+    downloads, scanned, validated, deleted = [], [], [], []
+    class Response(BytesIO):
+        headers = {}
+    def opener(url, timeout):
+        chunk = url.rsplit('/', 1)[-1]
+        downloads.append(chunk)
+        return Response(gzip.compress(overrun if chunk in failed else normal, mtime=0))
+    monkeypatch.setattr(dl, 'urlopen', opener)
+    monkeypatch.setattr(ex, 'ProcessPoolExecutor', thread_pool_factory)
+
+    tolerant = capture._pcap
+    def strict_v2(stream, magic):
+        # Model the previous reader's additional acceptance condition. Every
+        # other record fact and all production decode/publication code are real.
+        position = stream.tell()
+        endian = '<' if magic in (b'\xd4\xc3\xb2\xa1', b'\x4d\x3c\xb2\xa1') else '>'
+        snaplen = struct.unpack(endian+'HHIIII', stream.read(20))[4]
+        stream.seek(position)
+        for record in tolerant(stream, magic):
+            if record.captured_length > snaplen:
+                raise capture.CaptureError('malformed captured/original record length')
+            yield record
+    monkeypatch.setattr(capture, '_pcap', strict_v2)
+    with pytest.raises(ex.IncompleteExtractionError):
+        ex.run_extract(options, source_url_resolver=resolver)
+    before = load_json_object(options.dataset_root/'dataset_manifest.json')
+    assert before['status'] == 'incomplete'
+    assert {c for c, s in before['chunks'].items() if s['status'] == 'failed'} == failed
+    assert sum(s['status'] == 'success' for s in before['chunks'].values()) == 94
+    assert before['tool'] == {'name': 'mawi-context-analysis', 'version': '0.1.0', 'extraction': 'v2'}
+    immutable = {p: p.read_bytes() for directory in ('provenance', 'cohort', 'observations')
+                 for p in (options.dataset_root/directory).rglob('*') if p.is_file()}
+    raw_before = {}
+    for chunk in failed:
+        assert not (options.dataset_root/'observations'/chunk).exists()
+        raw, metadata, _ = dl._paths(chunk, options.spool_root)
+        raw_before[chunk] = (raw.read_bytes(), metadata.read_bytes())
+        assert asdict(dl._owned_source(chunk, resolver(DAY, chunk), options.spool_root)) == before['chunks'][chunk]['source']
+
+    monkeypatch.setattr(capture, '_pcap', tolerant)
+    # The target-flow consumer must decode/count overruns normally too, with
+    # the existing malformed-packet skip policy rather than a snaplen skip.
+    from mawi_context.flow import parse_target_flows
+    parsed = parse_target_flows(dl._paths('202604081430', options.spool_root)[0])
+    assert parsed.frame.packet_count.tolist() == [2, 1]
+    assert parsed.frame.captured_frame_bytes.tolist() == [236, 118]
+    assert parsed.frame.original_frame_bytes.tolist() == [1262, 1272]
+    assert parsed.skipped_packet_counts == {'malformed_tcp_header_length': 1}
+
+    scan, reload_cache, delete = ex._scan_chunk_worker, ex.load_validated_chunk, ex._delete_owned_raw
+    def worker(task):
+        scanned.append(task.chunk_id)
+        assert task.chunk_id in failed
+        raw, metadata, _ = dl._paths(task.chunk_id, options.spool_root)
+        assert (raw.read_bytes(), metadata.read_bytes()) == raw_before[task.chunk_id]
+        result = scan(task)
+        assert raw.exists() and metadata.exists()
+        assert not (options.dataset_root/'observations'/task.chunk_id).exists()
+        return result
+    def reload(root, chunk, **kwargs):
+        manifest = reload_cache(root, chunk, **kwargs)
+        validated.append(chunk)
+        return manifest
+    def delete_after_validation(source, spool):
+        assert source.chunk_id in validated
+        delete(source, spool)
+        deleted.append(source.chunk_id)
+    monkeypatch.setattr(ex, '_scan_chunk_worker', worker)
+    monkeypatch.setattr(ex, 'load_validated_chunk', reload)
+    monkeypatch.setattr(ex, '_delete_owned_raw', delete_after_validation)
+    monkeypatch.setattr(ex, 'download_chunk', lambda *a, **kw: pytest.fail('recovery must reuse raw/provenance'))
+    downloads.clear()
+    assert ex.run_extract(options, source_url_resolver=resolver) == options.dataset_root
+    assert set(scanned) == failed and len(scanned) == 2 and downloads == []
+    assert set(validated) == set(ids)
+    assert set(deleted) == failed and len(deleted) == 2
+    assert all(p.read_bytes() == content for p, content in immutable.items())
+    complete = load_json_object(options.dataset_root/'dataset_manifest.json')
+    assert complete['status'] == 'success'
+    assert complete['cohort_identity'] == before['cohort_identity']
+    assert all(s['status'] == 'success' for s in complete['chunks'].values())
+    import pyarrow.parquet as pq
+    for chunk in failed:
+        manifest = reload_cache(options.dataset_root, chunk,
+                                expected_cohort_identity=before['cohort_identity'])
+        assert manifest['source'] == before['chunks'][chunk]['source']
+        assert manifest['manifest_schema_version'] == 'chunk-manifest-v2'
+        assert manifest['skipped_packet_counts'] == {'malformed_tcp_header_length': 1}
+        directory = options.dataset_root/'observations'/chunk
+        target = pq.read_table(directory/'target_packets.parquet').to_pydict()
+        source = pq.read_table(directory/'source_context_packets.parquet').to_pydict()
+        assert target['packet_index'] == [1, 2, 4]
+        assert target['captured_frame_length'] == [182, 118, 54]
+        assert target['original_frame_length'] == [1208, 1272, 54]
+        assert target['timestamp'] == [10.125, 11.5, 500.5]
+        assert source['packet_index'] == [1, 2]
+        assert not dl._paths(chunk, options.spool_root)[0].exists()
+        assert not dl._paths(chunk, options.spool_root)[1].exists()
+    snapshot = {p: p.read_bytes() for p in options.dataset_root.rglob('*') if p.is_file()}
+    scanned.clear()
+    ex.run_extract(options, source_url_resolver=resolver)
+    assert scanned == [] and downloads == []
+    assert all(p.read_bytes() == content for p, content in snapshot.items())

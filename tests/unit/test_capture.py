@@ -1,4 +1,5 @@
 import gzip
+from io import BytesIO
 import struct
 import sys
 from pathlib import Path
@@ -7,12 +8,13 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'helpers'))
 from pcap_factory import block, packet, pcap_bytes, pcapng_bytes, write_capture
-from mawi_context.capture import CaptureError, iter_capture_records
+from mawi_context.capture import CaptureError, CaptureRecord, iter_capture_records, _records
 
 
 @pytest.mark.parametrize('ng,compressed,endian,nano', [
-    (False, False, '<', False), (False, False, '>', False),
-    (False, False, '<', True), (False, True, '<', False),
+    (False, compressed, endian, nano)
+    for compressed in (False, True) for endian in ('<', '>') for nano in (False, True)
+] + [
     (True, False, '<', False), (True, False, '>', False),
     (True, True, '<', False),
 ])
@@ -40,7 +42,6 @@ def test_rejects_non_ethernet(tmp_path, ng):
     pcap_bytes()+b'\x00'*15,
     pcap_bytes()+struct.pack('<IIII', 1, 0, 5, 5)+b'ab',
     pcap_bytes()+struct.pack('<IIII', 1, 0, 6, 5)+b'abcdef',
-    pcap_bytes(snaplen=4)+struct.pack('<IIII', 1, 0, 5, 5)+b'abcde',
     pcap_bytes()+struct.pack('<IIII', 1, 1000000, 0, 0),
     pcapng_bytes()[:-1], pcapng_bytes()+struct.pack('<II', 6, 11),
     pcapng_bytes()+block(6, struct.pack('<IIIII', 0, 0, 0, 6, 5)+b'abcdef'),
@@ -95,3 +96,91 @@ def test_finite_pcapng_sections_preserve_global_packet_order(tmp_path):
     records = list(iter_capture_records(path))
     assert [r.packet_index for r in records] == [1, 2]
     assert [r.timestamp for r in records] == [1, 2]
+
+
+@pytest.mark.parametrize('caplen,original', [(182, 1208), (118, 1272), (54, 1208)])
+@pytest.mark.parametrize('endian', ['<', '>'])
+@pytest.mark.parametrize('nano', [False, True])
+@pytest.mark.parametrize('compressed', [False, True])
+def test_classic_snaplen_is_not_a_record_boundary(tmp_path, caplen, original, endian, nano, compressed):
+    # Distinct bytes detect clipping, record misalignment and extra body reads.
+    frame = bytes(range(caplen))
+    following = b'next record'
+    path = write_capture(tmp_path/'classic', [(10.125, frame, original),
+                                             (500.5, following, 20)],
+                         snaplen=96, endian=endian, nano=nano, compressed=compressed)
+    assert list(iter_capture_records(path)) == [
+        CaptureRecord(1, 10.125, frame, caplen, original),
+        CaptureRecord(2, 500.5, following, 11, 20),
+    ]
+
+
+@pytest.mark.parametrize('endian', ['<', '>'])
+@pytest.mark.parametrize('nano', [False, True])
+@pytest.mark.parametrize('damage', ['original', 'body', 'header', 'timestamp', 'version', 'snaplen'])
+def test_classic_tolerance_does_not_accept_corruption(tmp_path, endian, nano, damage):
+    header = pcap_bytes(snaplen=96, endian=endian, nano=nano)
+    record = struct.pack(endian+'IIII', 10, 125000000 if nano else 125000, 182, 1208)
+    body = bytes(range(182))
+    message = 'malformed'
+    if damage == 'original':
+        record = struct.pack(endian+'IIII', 10, 0, 182, 181)
+    elif damage == 'body':
+        body = body[:-1]
+        message = 'truncated'
+    elif damage == 'header':
+        # The overrun itself is complete; the following header is partial.
+        body += b'\x00'*15
+        message = 'truncated'
+    elif damage == 'timestamp':
+        record = struct.pack(endian+'IIII', 10, 10**9 if nano else 10**6, 182, 1208)
+    elif damage == 'version':
+        header = header[:4] + struct.pack(endian+'HH', 2, 3) + header[8:]
+    elif damage == 'snaplen':
+        header = pcap_bytes(snaplen=0, endian=endian, nano=nano)
+    path = tmp_path/'bad'
+    path.write_bytes(header+record+body)
+    with pytest.raises(CaptureError, match=message):
+        list(iter_capture_records(path))
+
+
+@pytest.mark.parametrize('endian', ['<', '>'])
+@pytest.mark.parametrize('kind', [2, 6])
+@pytest.mark.parametrize('compressed', [False, True])
+def test_pcapng_snaplen_overrun_remains_fatal(tmp_path, endian, kind, compressed):
+    section = block(0x0a0d0d0a, struct.pack(endian+'IHHq', 0x1a2b3c4d, 1, 0, -1), endian)
+    interface = block(1, struct.pack(endian+'HHI', 1, 0, 96), endian)
+    fields = 'IIIII' if kind == 6 else 'HHIIII'
+    values = (0, 0, 10125000, 182, 1208) if kind == 6 else (0, 0, 0, 10125000, 182, 1208)
+    data = section + interface + block(kind, struct.pack(endian+fields, *values)+bytes(range(182)), endian)
+    path = tmp_path/'ng'
+    path.write_bytes(gzip.compress(data) if compressed else data)
+    with pytest.raises(CaptureError, match='captured/original'):
+        list(iter_capture_records(path))
+
+
+def test_classic_overrun_still_checks_gzip_trailer(tmp_path):
+    data = pcap_bytes([(10.125, bytes(range(182)), 1208)], snaplen=96)
+    path = tmp_path/'bad.gz'
+    path.write_bytes(gzip.compress(data)[:-5])
+    with pytest.raises(CaptureError, match='truncated'):
+        list(iter_capture_records(path))
+
+
+@pytest.mark.parametrize('caplen', [16*1024*1024 + 1, 0xffffffff])
+def test_huge_classic_overrun_is_rejected_before_body_read(caplen):
+    class HeaderOnly(BytesIO):
+        def read(self, size=-1):
+            assert 0 <= size <= 20, 'must reject the length before reading the body'
+            return super().read(size)
+    stream = HeaderOnly(pcap_bytes(snaplen=96)+struct.pack('<IIII', 1, 0, caplen, caplen))
+    with pytest.raises(CaptureError, match='safety limit'):
+        list(_records(stream))
+
+
+@pytest.mark.parametrize('caplen,snaplen', [(16*1024*1024, 96),
+                                           (16*1024*1024 + 1, 16*1024*1024 + 1)])
+def test_classic_overrun_limit_preserves_boundary_and_prior_acceptance(caplen, snaplen):
+    body = b'x'*caplen
+    records = list(_records(BytesIO(pcap_bytes([(10.125, body, caplen)], snaplen=snaplen))))
+    assert records == [CaptureRecord(1, 10.125, body, caplen, caplen)]

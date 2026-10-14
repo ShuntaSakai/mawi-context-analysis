@@ -78,6 +78,30 @@ Target flow extraction and 24-hour observation extraction must apply this same s
 
 The reported laboratory smoke on target `202604081400` stopped at packet index `5968733`, timestamp `1775624416.966622`, after `4763795` decoded packets and `1204937` counted skips (`29430` capture-truncated, `10328` fragments, `7923` non-IP, `1157256` non-TCP/UDP); accounting totals `5968732` preceding records. Its synthetic regression models Ethernet/IPv4 IHL 20, total length 72, protocol 6, DF-only `0x4000`, captured/original lengths 54/86, zero ports, TCP Data Offset 0 and flags 0. The minimum 20 TCP bytes are captured, so the reason is `malformed_tcp_header_length`, not `capture_truncated_undecodable`. No real MAWI bytes enter the repository, and this amendment's validation is synthetic only.
 
+### 2.6 Classic PCAP snaplen tolerance (focused amendment, 2026-10-14)
+
+For Classic PCAP only, the global `snaplen` is not a record-body boundary.
+Accept `caplen > snaplen` when `caplen <= original` and all declared body bytes
+exist. Read exactly `caplen` bytes, preserve both lengths, frame, timestamp and
+1-based packet index, and pass the record to the unchanged packet decoder.
+Never clip the frame or skip a packet solely because it exceeds snaplen.
+Malformed headers/timestamps, partial record headers/bodies and gzip corruption
+remain fatal `CaptureError`. PCAPNG retains its strict interface-snaplen check.
+
+Newly admitted Classic PCAP snaplen overruns are limited to **16 MiB** captured
+bytes per record; reject larger overruns before reading the body. This is an
+allocation safety bound for the tolerance extension, not an inferred network
+packet length. Records with `caplen <= snaplen` retain their existing acceptance
+conditions, including when the declared snaplen exceeds this bound. This focused
+change does not harden every preexisting large-snaplen allocation path.
+
+The human reports 94 successful chunks and two failed chunks (`202604081430`,
+`202604082130`) for 2026-04-08. Independent diagnostic scans reportedly reached
+EOF with 56 and 31 snaplen overruns, respectively, intact gzip streams, matching
+source SHA-256, and `caplen <= original`. These are human-provided diagnostic
+results, not validation of this amended extractor on real captures. Validation
+of this amendment uses synthetic fixtures only.
+
 ## 3. Context source identity
 
 Each target flow receives a `context_source_ip` and a `context_source_basis`.
@@ -302,6 +326,39 @@ Local absolute paths are not part of durable dataset identity.
 Allowed decode-failure codes are `packet_header_exceeds_declared_length`, `incomplete_packet_header`, `ethernet_ip_version_mismatch`, `malformed_ipv4_length`, `ipv4_length_exceeds_original_frame_length`, `ipv6_length_exceeds_original_frame_length`, `malformed_ipv6_authentication_header_length`, `malformed_tcp_header_length` and `malformed_udp_length`, in addition to the four existing exclusions in §2.5. Validators reject missing/invalid maps, unknown codes and old semantic identities on reuse and portable aggregation. Aggregation also requires the target chunk's skip map to agree with target flow provenance for the same raw source. These are descriptive extraction provenance, not result classifications or additional context CSV metrics. Structural validation cannot reconstruct scan counts without raw captures or authenticate coordinated edits to otherwise valid manifests.
 
 This amendment uses `flow-manifest-v2`, `chunk-manifest-v2` and tool extraction identity `v2` (package version remains `0.1.0`). The dataset's `observation_schemas.chunk_manifest` becomes `chunk-manifest-v2`. Old extraction-v1 evidence must fail explicitly rather than be relabeled or silently reused. `dataset-manifest-v1`, `cohort-manifest-v1`, `flows-v1`, `cohort-v1`, `target-packets-v1`, `source-context-packets-v1` and all result CSV columns remain unchanged because their structures/columns are unchanged.
+
+### 9.1 Compatibility of the Classic PCAP amendment
+
+Keep extraction `v2`, `flow-manifest-v2` and `chunk-manifest-v2`. This amendment
+extends the accepted Classic PCAP input domain without changing any record fact
+or decode/retention semantics for inputs that previously completed successfully.
+Every previously accepted input remains accepted with identical records. A
+previous v2 success therefore cannot contain a snaplen overrun: the strict reader
+would have failed the whole chunk or target provenance, not skipped the record.
+Compatible successful caches, `flows.csv` and `target_cohort.csv` can be reused
+with all existing identity, checksum, schema, row-count and provenance validation.
+Failed chunks have no successful cache to migrate. Never rewrite existing
+artifact manifests to imply that they were produced by the new reader.
+
+The extraction identity identifies observational/decode semantics; it does not
+identify an exact parser source revision. Bumping it alone would reject the
+dataset and target provenance on resume and would also require an aggregation
+compatibility change. Adding fields to current manifests would violate their
+exact-key/equality validators. Neither is necessary for this extension. Old v1
+evidence and invalid v2 evidence still fail validation.
+
+Record exact old/new code revisions separately. For this recovery, retain a
+dataset-external audit bundle naming policy
+`classic-pcap-snaplen-tolerance-2026-10-14`, the prior run's code evidence (or
+explicitly mark it unknown), new Git revision plus uncommitted diff, source-file
+SHA-256s, environment/command/logs, raw identities, before/after dataset state and
+artifact hashes. Preserve the 94 published chunk hashes and target provenance
+hashes byte-for-byte; associate the two newly published manifests with the new
+code evidence. Copy this audit bundle alongside the portable dataset for exact
+reader-revision reproducibility. A v2 manifest alone cannot distinguish these
+reader revisions; do not claim it can. Missing historical code evidence must be
+reported as a limitation, not inferred or fabricated. See
+[the recovery procedure](../../classic-pcap-recovery.md).
 
 ## 10. Download, spool, and parallel execution
 

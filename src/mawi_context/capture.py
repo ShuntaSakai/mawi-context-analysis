@@ -1,4 +1,4 @@
-"""Strict, record-wise Ethernet PCAP/PCAPNG reading (including gzip)."""
+"""Record-wise Ethernet PCAP/PCAPNG reading with fatal container checks."""
 from collections.abc import Iterator
 from dataclasses import dataclass
 import gzip
@@ -29,7 +29,19 @@ def _read(stream: BinaryIO, size: int, *, eof: bool = False) -> bytes:
     return data
 
 
-def _lengths(caplen: int, original: int, snaplen: int) -> None:
+# Bound only the newly accepted Classic PCAP overruns. A global cap would
+# change acceptance of previously valid captures with a larger snaplen.
+_CLASSIC_SNAPLEN_OVERRUN_LIMIT = 16 * 1024 * 1024
+
+
+def _pcap_lengths(caplen: int, original: int, snaplen: int) -> None:
+    if caplen > original:
+        raise CaptureError('malformed captured/original record length')
+    if caplen > snaplen and caplen > _CLASSIC_SNAPLEN_OVERRUN_LIMIT:
+        raise CaptureError('Classic PCAP snaplen overrun exceeds 16 MiB safety limit')
+
+
+def _pcapng_lengths(caplen: int, original: int, snaplen: int) -> None:
     if caplen > original or (snaplen and caplen > snaplen):
         raise CaptureError('malformed captured/original record length')
 
@@ -56,7 +68,7 @@ def _pcap(stream: BinaryIO, magic: bytes) -> Iterator[CaptureRecord]:
         seconds, fraction, caplen, original = struct.unpack(endian+'IIII', header)
         if fraction >= scale:
             raise CaptureError('malformed PCAP timestamp')
-        _lengths(caplen, original, snaplen)
+        _pcap_lengths(caplen, original, snaplen)
         frame = _read(stream, caplen)
         index += 1
         yield CaptureRecord(index, seconds+fraction/scale, frame, caplen, original)
@@ -151,7 +163,7 @@ def _pcapng(stream: BinaryIO, magic: bytes) -> Iterator[CaptureRecord]:
             if interface >= len(interfaces):
                 raise CaptureError('unknown PCAPNG interface')
             snaplen, scale, offset = interfaces[interface]
-            _lengths(caplen, original, snaplen)
+            _pcapng_lengths(caplen, original, snaplen)
             end = 20 + ((caplen+3) & ~3)
             if end > len(body):
                 raise CaptureError('truncated PCAPNG packet body')
@@ -170,8 +182,9 @@ def _pcapng(stream: BinaryIO, magic: bytes) -> Iterator[CaptureRecord]:
 def iter_capture_records(path: Path) -> Iterator[CaptureRecord]:
     """Stream records in capture order with 1-based indexes and both lengths.
 
-    A complete snaplen-limited record is valid. Container truncation is fatal,
-    including corruption encountered after earlier records have been yielded.
+    Classic PCAP permits bounded snaplen overruns and reads the full caplen;
+    PCAPNG enforces interface snaplen. Container truncation is fatal, including
+    corruption encountered after earlier records have been yielded.
     """
     try:
         with Path(path).open('rb') as raw:
